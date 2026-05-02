@@ -1,0 +1,65 @@
+current_seed = seed if seed is not None else CONFIG.seed
+    if current_seed == -1:
+        current_seed = np.random.randint(0, 2**32 - 1)
+    torch.manual_seed(current_seed)
+
+    # --- NEW PARAGRAPH CHUNKING LOGIC ---
+    do_split = split_by_newline if split_by_newline is not None else CONFIG.split_by_newline
+    if do_split:
+        import re
+        # Split by one or more newlines, strip spaces, ignore empty chunks
+        raw_chunks = re.split(r'\n+', text)
+        text_chunks = [c.strip() for c in raw_chunks if c.strip()]
+        if not text_chunks:
+            text_chunks = [text.strip()]
+    else:
+        text_chunks = [text.strip()]
+
+    all_audio_segments = []
+
+    with state.semaphore, torch.inference_mode():
+        state.model.set_ddpm_inference_steps(ddpm_steps or CONFIG.ddpm_steps)
+        
+        gen_config = {}
+        if use_sampling or CONFIG.use_sampling:
+            gen_config['do_sample'] = True
+            gen_config['temperature'] = temperature or CONFIG.temperature
+            gen_config['top_p'] = top_p or CONFIG.top_p
+        else:
+            gen_config['do_sample'] = False
+
+        for i, chunk_text in enumerate(text_chunks):
+            formatted_text = f"Speaker 1: {chunk_text}\n"
+            
+            inputs = state.processor(
+                text=[formatted_text],
+                voice_samples=[voice_samples] if voice_samples else [None],
+                return_tensors="pt",
+            ).to(state.model.device)
+
+            with obs.observe_latency(obs.SYNTHESIS_LATENCY, (response_format or "wav").lower()):
+                obs.ACTIVE_INFERENCES.inc()
+                try:
+                    outputs = state.model.generate(
+                        **inputs,
+                        cfg_scale=cfg_scale or CONFIG.cfg_scale,
+                        seed=current_seed,
+                        generation_config=gen_config,
+                        tokenizer=state.processor.tokenizer,
+                        verbose=False,
+                    )
+                finally:
+                    obs.ACTIVE_INFERENCES.dec()
+            
+            # --- COMBINE AND ADD NATURAL SILENCE GAPS ---
+            speech_tensor = outputs.speech_outputs[0]
+            if speech_tensor is not None and speech_tensor.numel() > 0:
+                cpu_tensor = speech_tensor.cpu()
+                all_audio_segments.append(cpu_tensor)
+                
+                # Add a 400ms pause between paragraphs (but not after the last one)
+                if i < len(text_chunks) - 1:
+                    silence_samples = int(0.4 * state.sample_rate)
+                    silence_shape = list(cpu_tensor.shape)
+                    silence_shape[-1] = silence_samples
+                    all_audio_segments.append(torch.zeros(silence_shape, dtype=cpu_tensor.dtype, device='cpu'))

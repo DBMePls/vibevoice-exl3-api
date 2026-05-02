@@ -1,157 +1,158 @@
-# VibeVoice API
+# 🎙️ VibeVoice-EXL3 API
 
-> This is an OpenAI-compatible API for VibeVoice.
+> **An insanely fast, low-VRAM, OpenAI-compatible REST API for VibeVoice, powered by ExLlamaV3.**
 
-## Community
+This is a heavily optimized fork of the original VibeVoice API. By decoupling the LLM generation phase from the diffusion process and running it through a custom **ExLlamaV3** backend, this API drastically reduces VRAM requirements and significantly accelerates time-to-first-audio (TTFA) and overall generation speed.
 
-**Join the unofficial Discord community: https://discord.gg/ZDEYTTRxWG** - share samples, ask questions, discuss fine-tuning, etc.
+It functions as a drop-in replacement for OpenAI's `audio.speech.create` endpoint, meaning it works instantly with existing frontend UIs, Chatbots, and SDKs.
 
-## Installation
+---
 
+## ✨ Key Features
+* 🚀 **ExLlamaV3 Backend:** The autoregressive LLM component runs on EXL3, utilizing highly optimized CUDA kernels for lightning-fast token generation.
+* 💾 **Low VRAM Footprint:** Fits much larger VibeVoice models into consumer GPUs (e.g., 8-bit quantization) without Out-Of-Memory errors.
+* 🌐 **OpenAI SDK Compatible:** Drop-in replacement for the official OpenAI Python/JS SDKs.
+* ⚡ **True Streaming:** Supports Server-Sent Events (SSE) and native binary streaming (chunk-by-chunk playback before generation finishes).
+* 🎭 **Zero-Shot Voice Cloning:** Clone voices on the fly by passing a path or base64 string to a reference `.wav` file.
+* 🎛️ **Advanced Generation Controls:** Tune Dynamic CFG, temperature, top_p, and diffusion steps directly via API request payloads.
+* 💻 **Built-in Web Console:** Includes a fully functional HTML streaming console for testing voices and testing generation parameters.
+
+---
+
+## 🤝 Acknowledgements & Credits
+
+This project stands on the shoulders of giants. Massive thanks to the open-source community:
+* **[Mozer](https://github.com/Mozer/exllamav3)** - For reverse-engineering the VibeVoice architecture and porting the LLM component to the EXL3 engine. (Check out their [ComfyUI Node](https://github.com/mozer/comfyUI-vibevoice-exl3)!).
+* **[Turboderp](https://github.com/turboderp-org/exllamav3)** - The creator of ExLlamaV3, without which this level of local LLM performance wouldn't be possible.
+* **[VibeVoice-Community](https://github.com/vibevoice-community/VibeVoice-API)** - For the original OpenAI-compatible API skeleton this fork is based on.
+
+---
+
+## 📦 Installation
+
+Because this API relies on ExLlamaV3, you need a proper CUDA/C++ build environment on your system (e.g., Visual Studio C++ Build Tools on Windows, or `build-essential` on Linux).
+
+### 1. Install the Custom ExLlamaV3 Backend
+You must install the specialized VibeVoice fork of ExLlamaV3 first.
 ```bash
-git clone https://github.com/vibevoice-community/VibeVoice-API
-cd VibeVoice/
+pip install git+https://github.com/DontBlameMep/exllamav3-vibevoice.git
+```
+*(Note: This compiles CUDA kernels and may take several minutes).*
 
-uv pip install -e .
+### 2. Install this API
+```bash
+git clone https://github.com/DontBlameMep/vibevoice-exl3-api.git
+cd vibevoice-exl3-api
+
+# Install the API requirements
+pip install -e .
 ```
 
-## Model Zoo
+*(Optional) If you want to output non-WAV formats like `mp3`, `opus`, or `aac`, ensure you have `ffmpeg` installed and added to your system PATH.*
 
-| Model | Context Length | Generation Length |  Weight |
-|-------|----------------|----------|----------|
-| VibeVoice-1.5B | 64K | ~90 min | [HF link](https://huggingface.co/vibevoice/VibeVoice-1.5B) |
-| VibeVoice-Large| 32K | ~45 min | [HF link](https://huggingface.co/vibevoice/VibeVoice-7B) |
+---
 
-## Getting Started
+## 🧠 Model Weights
 
-Run a local server that is compatible with the OpenAI audio API (`client.audio.speech.create`). It wraps VibeVoice to synthesize speech from text.
+Because this implementation uses ExLlamaV3, the standard VibeVoice `.safetensors` files won't work natively. The model has been cleanly split into two parts:
+1. **The LLM Component** (Quantized to EXL3)
+2. **The Diffusion Component** (No-LLM, keeping the acoustic tokenizers and UNet)
 
-### Start the server
+By default, the server will attempt to download these pre-split models from HuggingFace on the first run:
+* **LLM:** `tensorbanana/vibevoice-7b-exl3-8bit`
+* **Diffusion:** `tensorbanana/vibevoice-7b-no-llm-bf16`
+
+*(If you download these manually, you can point the server to your local folders via arguments).*
+
+---
+
+## 🚀 Usage & Configuration
+
+### Starting the Server
+Start the API server by running:
 ```bash
-python -m vibevoice_api.server --model_path vibevoice/VibeVoice-1.5B --port 8000
+python -m vibevoice_api.server --port 8000
 ```
 
-### API base path (default: `/v1`)
-All routes are mounted on `/v1` by default. To override the prefix, set `VIBEVOICE_API_BASE_PATH` (leading slash required) **before** launching the server:
-```bash
-export VIBEVOICE_API_BASE_PATH=/api
-python -m vibevoice_api.server --model_path vibevoice/VibeVoice-1.5B --port 8000
-```
-Clients must include the same prefix when constructing URLs. The static console is served at `<base_path>/web/console.html`.
+**Optional Arguments:**
+* `--host 0.0.0.0` (Expose to local network)
+* `--port 8000` (Change listening port)
+* `--diffusion-model-path <path>` (Path to the No-LLM diffusion folder)
+* `--llm-model-path <path>` (Path to the EXL3 quantized folder)
 
-## Endpoints
+### Accessing the Web Console
+Once the server is running, you can access the built-in testing interface from your browser:
+* **Streaming Console:** `http://127.0.0.1:8000/v1/web/console.html`
 
-### POST `<base_path>/audio/speech`
-Synthesize speech from text.
+---
 
-**Request fields (OpenAI-compatible):**
-- `model` (string): model id or local path (e.g., `vibevoice/VibeVoice-1.5B`).
-- `voice` (string): name mapped to a reference voice, a filesystem path (prefix with `path:` or absolute), or an alias from a voice map.
-- `input` (string): the input text.
-- `response_format` (string): `wav`, `pcm` (native), or `mp3` / `opus` / `aac` (require ffmpeg).
-- `stream_format` (string, optional): set to `sse` for Server-Sent Events (streamed base64 PCM chunks).
-- `extra_body` (object, optional):
-  - `voice_path`: absolute/relative path to a reference audio file.
-  - `voice_data`: base64-encoded WAV bytes (optionally as a data URL).
+## 📡 API Examples
 
-**Python example (OpenAI SDK ≥ 1.40):**
+All routes are mounted under `/v1` to match OpenAI's structure.
+
+### 🐍 Python (Using the Official OpenAI SDK)
 ```python
 from openai import OpenAI
 
-base_path = "/v1"  # or your VIBEVOICE_API_BASE_PATH
-client = OpenAI(base_url=f"http://127.0.0.1:8000{base_path}", api_key="<YOUR_API_KEY>")
+# Point the client to your local server
+client = OpenAI(
+    base_url="http://127.0.0.1:8000/v1", 
+    api_key="sk-no-key-required"
+)
 
-speech = client.audio.speech.create(
-    model="vibevoice/VibeVoice-1.5B",
-    voice="Andrew",
-    input="Hello from VibeVoice!",
+response = client.audio.speech.create(
+    model="vibevoice", # Ignored by backend (loads defaults)
+    voice="Alice",     # Name of reference voice in /demo/voices/
+    input="This generation is incredibly fast thanks to ExLlamaV3!",
     response_format="wav",
 )
 
-with open("out.wav", "wb") as f:
-    f.write(speech.read())
+with open("output.wav", "wb") as f:
+    f.write(response.read())
 ```
 
-**Pure HTTP example (cURL):**
+### 💻 cURL (Standard HTTP Request)
 ```bash
-curl -X POST "http://127.0.0.1:8000/v1/audio/speech"   -H "Content-Type: application/json"   -H "Authorization: Bearer <YOUR_API_KEY>"   -d '{
-    "model": "vibevoice/VibeVoice-1.5B",
-    "voice": "alloy",
-    "input": "Hello!",
+curl -X POST "http://127.0.0.1:8000/v1/audio/speech" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "voice": "Alice",
+    "input": "This is a direct API call test.",
     "response_format": "mp3"
-  }' --output out.mp3
+  }' \
+  --output test.mp3
 ```
 
-**Streaming (SSE):**
-Set `"stream_format": "sse"` in the request body to receive a stream of SSE events carrying base64-encoded PCM audio chunks. A JS example client is provided in `scripts/js/openai_sse_client.mjs`.
-
-## Voice Mapping
-
-You can define stable, human-friendly voice names via a YAML file that is auto-loaded on each request.
-- Voice YAML mapping: You can use YAML to manage aliases or automatically scan multiple folders (see next section).
-
-**Search order (first found):**
-1. Path from `VIBEVOICE_VOICE_MAP` (relative to repo root or absolute)  
-2. `./voice_map.yaml`  
-3. `./config/voice_map.yaml`
-
-**Example (`voice_map.yaml`):**
-```yaml
-alloy: en-Frank_man
-ash: en-Carter_man
-
-aliases:
-  promo_female: demo/voices/en-Alice_woman.wav
-
-directories:
-  - demo/custom_voices
+### 🎭 Custom Voice Cloning (Zero-Shot)
+You can clone a voice on the fly without restarting the server by passing a path to a reference `.wav` file in the `extra_body`.
+```python
+response = client.audio.speech.create(
+    model="vibevoice",
+    voice="ignored", # Ignored when using voice_path
+    input="I am speaking with a brand new cloned voice.",
+    response_format="wav",
+    extra_body={
+        "voice_path": "C:/path/to/my/custom_voice.wav"
+    }
+)
 ```
 
-Then call with `voice: "alloy"`, or use `extra_body.voice_path` / `extra_body.voice_data` per request.
+*(You can also manage permanent voices by dropping them in the `demo/voices/` folder, or mapping them in `voice_map.yaml`).*
 
-## Formats
+---
 
-- `wav`, `pcm`: native outputs (no extra dependencies).
-- `mp3`, `opus`, `aac`: require a working **ffmpeg** binary. Either ensure `ffmpeg` is on PATH or set `VIBEVOICE_FFMPEG` to the binary path.
+## ⚙️ Advanced Generation Tuning
+You can pass additional kwargs inside `extra_body` (in Python) or directly in your JSON payload to fine-tune the EXL3 and Diffusion steps:
 
-## Authentication & Admin (optional)
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ddpm_steps` | int | `16` | Number of diffusion steps. Lower = faster, Higher = better quality. |
+| `cfg_scale` | float | `1.3` | Classifier-free guidance. Controls adherence to the reference voice. |
+| `temperature` | float | `0.95` | LLM temperature. Alters the pacing/inflection of the generated speech. |
+| `increase_cfg` | bool | `false` | Experimental: Dynamically boosts CFG during the first 50% of steps for more emotion. |
+| `split_by_newline`| bool | `false` | Automatically splits long text by paragraphs to prevent context degradation. |
 
-By default, API-key auth is **disabled**. To enable:
-```bash
-export VIBEVOICE_REQUIRE_API_KEY=1
-```
+---
 
-With auth enabled, include `Authorization: Bearer <YOUR_API_KEY>` in client requests.
-
-**Admin key management** (requires `VIBEVOICE_ADMIN_TOKEN`; routes respect your `<base_path>` and default to `/v1`):
-
-_List stored key hashes_
-```bash
-curl -sS -H "Authorization: Bearer $VIBEVOICE_ADMIN_TOKEN"   http://127.0.0.1:8000/v1/admin/keys
-```
-
-_Create/import a key (omit body to auto-generate with the given prefix)_
-```bash
-curl -sS -X POST -H "Authorization: Bearer $VIBEVOICE_ADMIN_TOKEN"   -H "Content-Type: application/json"   -d '{"prefix": "sk-"}'   http://127.0.0.1:8000/v1/admin/keys
-```
-
-_Revoke a key by stored hash_
-```bash
-curl -sS -X DELETE -H "Authorization: Bearer $VIBEVOICE_ADMIN_TOKEN"   http://127.0.0.1:8000/v1/admin/keys/<key_hash>
-```
-
-**Logs** are written under `logs/` and can be configured via:
-- `VIBEVOICE_LOG_DIR`
-- `VIBEVOICE_LOG_PROMPTS=1`
-- `VIBEVOICE_PROMPT_MAXLEN=4096`
-
-## Notes
-- Only TTS (`/audio/speech`) is implemented; there are **no STT endpoints**.
-- Legacy root routes (e.g., `/audio/speech`, `/metrics`) remain for backwards compatibility, but new integrations should prefer the explicit `<base_path>`.
-
-
-## License
-
-The source code and models are licensed under the MIT License. See the [LICENSE](./LICENSE) file for details.
-
-Note: Microsoft has removed the original repo and models. This fork is based off of the MIT-licensed code from Microsoft.
+## 📜 License
+This project is released under the **GNU General Public License v3.0 License**. 
