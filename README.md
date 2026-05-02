@@ -35,13 +35,13 @@ Because this API relies on ExLlamaV3, you need a proper CUDA/C++ build environme
 ### 1. Install the Custom ExLlamaV3 Backend
 You must install the specialized VibeVoice fork of ExLlamaV3 first.
 ```bash
-pip install git+https://github.com/DontBlameMep/exllamav3-vibevoice.git
+pip install git+https://github.com/DBMePls/exllamav3-vibevoice.git
 ```
 *(Note: This compiles CUDA kernels and may take several minutes).*
 
 ### 2. Install this API
 ```bash
-git clone https://github.com/DontBlameMep/vibevoice-exl3-api.git
+git clone https://github.com/DBMePls/vibevoice-exl3-api.git
 cd vibevoice-exl3-api
 
 # Install the API requirements
