@@ -33,3 +33,11 @@ models/
 # IDEs
 .vscode/
 .idea/
+
+#stuff
+codebase_for_llm.txt
+create_project_overview.py
+voice-samples/
+voice-samples
+voice_map.yaml
+voice_map
