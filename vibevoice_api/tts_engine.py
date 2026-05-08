@@ -11,29 +11,6 @@ import torch
 import torch.nn.functional as F
 import logging
 
-# --- MONKEY PATCH START -------------------------------------------------------
-# Fix TimestepEmbedder to be compatible with CUDA Graphs
-# This prevents "operation not permitted when stream is capturing" errors
-try:
-    from vvembed.modular.modular_vibevoice_diffusion_head import TimestepEmbedder
-    
-    def fixed_timestep_embedding(t, dim, max_period=10000):
-        """Replacement that ensures tensors are created on the correct device."""
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding.to(t.dtype)
-
-    TimestepEmbedder.timestep_embedding = staticmethod(fixed_timestep_embedding)
-except ImportError:
-    pass
-# --- MONKEY PATCH END ---------------------------------------------------------
-
 # Add vvembed to Python Path
 VIBEVOICE_API_ROOT = os.path.dirname(os.path.abspath(__file__))
 VVEMBED_PATH = os.path.join(VIBEVOICE_API_ROOT, '..', 'vvembed')
@@ -49,65 +26,6 @@ from vvembed.modular.modeling_vibevoice_inference import VibeVoiceForConditional
 from vvembed.processor.vibevoice_processor import VibeVoiceProcessor
 
 log = logging.getLogger("vibevoice_api.tts_engine")
-
-# Check for SageAttention availability (Optional)
-try:
-    from sageattention import sageattn
-    SAGE_AVAILABLE = True
-except ImportError:
-    SAGE_AVAILABLE = False
-
-# --- CUDA GRAPH WRAPPER START -------------------------------------------------
-class CUDAGraphWrapper(torch.nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        self.graph = None
-        self.static_inputs = None
-        self.static_output = None
-        self.warmup_iters = 3
-
-    def __getattr__(self, name):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.model, name)
-
-    def forward(self, noisy_images, timesteps, condition):
-        # 1. Capture the graph on the first run with these shapes
-        if self.graph is None:
-            log.info(f"[GPU FORCE] Recording CUDA Graph for shapes: {noisy_images.shape}...")
-            
-            # Create static tensors (buffers) on GPU
-            self.static_inputs = (
-                noisy_images.clone(),
-                timesteps.clone(),
-                condition.clone()
-            )
-            
-            # Warmup to clear caches
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                for _ in range(self.warmup_iters):
-                    self.static_output = self.model(*self.static_inputs)
-            torch.cuda.current_stream().wait_stream(s)
-            
-            # Record the graph
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                self.static_output = self.model(*self.static_inputs)
-            log.info("[GPU FORCE] Graph Recorded successfully.")
-
-        # 2. Replay the graph (Fast Path)
-        self.static_inputs[0].copy_(noisy_images)
-        self.static_inputs[1].copy_(timesteps)
-        self.static_inputs[2].copy_(condition)
-        
-        self.graph.replay()
-        
-        return self.static_output.clone()
-# --- CUDA GRAPH WRAPPER END ---------------------------------------------------
 
 @dataclass
 class LoadedModel:
@@ -166,9 +84,9 @@ def _load_model(diffusion_model_path: str, llm_model_path: str, quant_mode: str,
             return _model_cache[cache_key]
 
         device, torch_dtype = _select_device()
-        model_kwargs = {"device_map": "auto", "torch_dtype": torch.bfloat16}
+        model_kwargs = {"device_map": {"": device}, "torch_dtype": torch.bfloat16}
 
-        # 1. Load LLM
+        # 1. Load LLM via ExLlama
         try:
             exllama_wrapper = _load_exllama_model(llm_model_path)
         except Exception as e:
@@ -179,7 +97,6 @@ def _load_model(diffusion_model_path: str, llm_model_path: str, quant_mode: str,
         log.info(f"Loading Diffusion Model from '{diffusion_model_path}'")
         processor = VibeVoiceProcessor.from_pretrained(diffusion_model_path)
         
-        # Explicitly set attention to SDPA to avoid overhead
         model_kwargs["attn_implementation"] = "sdpa"
         
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(
@@ -235,22 +152,11 @@ def synthesize(
             voice_samples = [resolved_path]
 
     current_seed = seed if seed is not None else CONFIG.seed
-    current_seed = seed if seed is not None else CONFIG.seed
     if current_seed == -1:
         current_seed = np.random.randint(0, 2**32 - 1)
     torch.manual_seed(current_seed)
 
-    # --- NEW PARAGRAPH CHUNKING LOGIC ---
-    do_split = split_by_newline if split_by_newline is not None else CONFIG.split_by_newline
-    if do_split:
-        import re
-        # Split by one or more newlines, strip spaces, ignore empty chunks
-        raw_chunks = re.split(r'\n+', text)
-        text_chunks = [c.strip() for c in raw_chunks if c.strip()]
-        if not text_chunks:
-            text_chunks = [text.strip()]
-    else:
-        text_chunks = [text.strip()]
+    text_chunks = [text.strip()]
 
     all_audio_segments = []
 
@@ -288,18 +194,9 @@ def synthesize(
                 finally:
                     obs.ACTIVE_INFERENCES.dec()
             
-            # --- COMBINE AND ADD NATURAL SILENCE GAPS ---
             speech_tensor = outputs.speech_outputs[0]
             if speech_tensor is not None and speech_tensor.numel() > 0:
-                cpu_tensor = speech_tensor.cpu()
-                all_audio_segments.append(cpu_tensor)
-                
-                # Add a 400ms pause between paragraphs (but not after the last one)
-                if i < len(text_chunks) - 1:
-                    silence_samples = int(0.4 * state.sample_rate)
-                    silence_shape = list(cpu_tensor.shape)
-                    silence_shape[-1] = silence_samples
-                    all_audio_segments.append(torch.zeros(silence_shape, dtype=cpu_tensor.dtype, device='cpu'))
+                all_audio_segments.append(speech_tensor.cpu())
 
     if not all_audio_segments:
         wav = np.zeros(int(0.5 * state.sample_rate), dtype=np.float32)
@@ -314,7 +211,6 @@ def synthesize(
     return data, content_type
 
 async def synthesize_stream_pcm(*args, **kwargs) -> AsyncIterator[np.ndarray]:
-    # Fallback streaming implementation
     data, _ = synthesize(**kwargs)
     import soundfile as sf
     import io

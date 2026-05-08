@@ -11,9 +11,9 @@ from transformers.generation import GenerationMixin, GenerationConfig, LogitsPro
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from transformers import modeling_utils
 from transformers.modeling_utils import PreTrainedModel
-from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.utils import logging
 
+from exllamav3.ext import exllamav3_ext as ext # <--- ExLlamaV3 Extension imported here!
 from exllamav3 import Config, Model, Cache, Tokenizer, DefaultSampler
 from exllamav3.modules.attn import prepare_flash_attn
 from exllamav3.util import Timer
@@ -25,7 +25,6 @@ from schedule.dpm_solver import DPMSolverMultistepScheduler
 from .configuration_vibevoice import VibeVoiceConfig
 
 from .modular_vibevoice_text_tokenizer import VibeVoiceTextTokenizer, VibeVoiceTextTokenizerFast
-
 from .modeling_vibevoice import VibeVoiceModel, VibeVoicePreTrainedModel
 from .streamer import AudioStreamer, AsyncAudioStreamer
 
@@ -33,40 +32,6 @@ logger = logging.get_logger(__name__)
 
 if not hasattr(modeling_utils, "ALL_PARALLEL_STYLES") or modeling_utils.ALL_PARALLEL_STYLES is None:
     modeling_utils.ALL_PARALLEL_STYLES = ["tp", "none", "colwise", "rowwise"]
-
-
-import sys, os
-from exllamav3 import Config, Model, Cache, Tokenizer
-import torch
-
-
-
-class CUDAGraphRunner:
-    def __init__(self, model_fn, sample_inputs):
-        self.model_fn = model_fn
-        self.graph = torch.cuda.CUDAGraph()
-        self.static_inputs = tuple(t.clone() for t in sample_inputs)
-        
-        # Warmup (crucial for allocation)
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                self.static_output = self.model_fn(*self.static_inputs)
-        torch.cuda.current_stream().wait_stream(s)
-        
-        # Capture
-        with torch.cuda.graph(self.graph):
-            self.static_output = self.model_fn(*self.static_inputs)
-
-    def __call__(self, *inputs):
-        # COPY data into the static memory addresses (This fixes the "Garbage Audio" issue)
-        for static, new_data in zip(self.static_inputs, inputs):
-            static.copy_(new_data)
-        
-        self.graph.replay()
-        return self.static_output
-# ------------------------------------
 
 class ExLlamaV3Wrapper:
     """Wrapper class for ExLlamaV3 integration"""
@@ -76,23 +41,16 @@ class ExLlamaV3Wrapper:
         self.positive_cache = positive_cache
         self.negative_cache = negative_cache
         self.config = config
-        self.hidden_size = config.hidden_size  # Adjust based on your config
-        
-        # Add attribute to store hidden states
+        self.hidden_size = config.hidden_size
         self.model.last_hidden_states = None
-        
-        # Track past lengths for both conditions (not sure if needed)
         self.positive_past_len = 0
         self.negative_past_len = 0
-        
-        # Base params for attention
         self.base_params = {
             "attn_mode": "flash_attn",
             "batch_shape": (1, 2048),
         }
     
     def prefill(self, input_ids):
-        """Prefill the prompt"""
         self.model.prefill(
             input_ids=input_ids,
             params={
@@ -104,35 +62,19 @@ class ExLlamaV3Wrapper:
         )
     
     def get_input_embeddings(self):
-        """Get the model's embedding module"""
-        return self.model.modules[0]  # The first module is typically the embedding layer
+        return self.model.modules[0]
     
     def compute_inputs_embeds(self, input_ids):
-        """Compute inputs_embeds using the model's embedding module with proper params"""
         embedding_module = self.get_input_embeddings()
-        
-        # Prepare params similar to how the model does it
         params = self.base_params.copy()
-        params["past_len"] = 0  # Reset for embedding computation
-        
-        # Ensure input_ids are on the right device
+        params["past_len"] = 0 
         input_ids = embedding_module.prepare_for_device(input_ids, params)
-        
-        # Compute embeddings using the module's forward method
         inputs_embeds = embedding_module.forward(input_ids, params)
-        
-        # If the embedding module has normalization, apply it
         if hasattr(embedding_module, 'normalize') and embedding_module.normalize:
-            # not executed
             inputs_embeds = inputs_embeds * (inputs_embeds.shape[-1] ** 0.5)
-        
         return inputs_embeds
         
     def forward(self, input_ids=None, inputs_embeds=None, position_ids=None, use_negative_cache=False):
-        """Forward pass with either input_ids or inputs_embeds, returns (logits, hidden_states)"""
-        
-        """Forward pass with separate cache for positive/negative conditions"""
-        # Select appropriate cache and past length
         if use_negative_cache:
             cache = self.negative_cache
             past_len = self.negative_past_len
@@ -147,16 +89,12 @@ class ExLlamaV3Wrapper:
             params["position_ids"] = position_ids.to(torch.int)
         
         if inputs_embeds is not None:
-            # Set sequence length for attention parameter preparation
             params["seq_len"] = inputs_embeds.shape[1]
-            
-            # Ensure inputs_embeds are on the correct device
             device = self.model.modules[0].device
             if inputs_embeds.device != device:
                 inputs_embeds = inputs_embeds.to(device)
-                
             logits, hidden_states = self.model.forward(
-                input_ids=None,         # Pass None for IDs when using embeds
+                input_ids=None,
                 params=params,
                 inputs_embeds=inputs_embeds,
             )
@@ -164,10 +102,9 @@ class ExLlamaV3Wrapper:
             logits, hidden_states = self.model.forward(
                 input_ids=input_ids,
                 params=params,
-                inputs_embeds=None,      # Explicitly pass None for embeds
+                inputs_embeds=None,
             )
         
-        # Update appropriate past length
         if use_negative_cache:
             self.negative_past_len += input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
         else:
@@ -176,11 +113,9 @@ class ExLlamaV3Wrapper:
         return logits, hidden_states
         
     def sample(self, logits, tokenizer):
-        """Sample from logits (not used)"""
         return self.sampler.forward(logits, tokenizer=tokenizer)
         
     def reset_cache(self, use_negative_cache=False, max_num_tokens=2048):
-        """Reset either positive or negative cache"""
         if use_negative_cache:
             self.negative_cache = Cache(self.model, max_num_tokens=2048)
             self.negative_past_len = 0
@@ -189,35 +124,24 @@ class ExLlamaV3Wrapper:
             self.positive_past_len = 0    
 
     def reset_all(self, max_num_tokens=2048):
-        """Completely reset both caches and all generation parameters"""
         self.positive_past_len = 0
         self.negative_past_len = 0        
     
     def unload(self):
-        """Completely unload ExLlamaV3 model and free all memory"""
         try:
-            # Unload the model using its built-in method
             if hasattr(self.model, 'unload'):
                 self.model.unload()
-            
-            # Delete all references to free memory
             del self.positive_cache
             del self.negative_cache
             del self.model
-            
-            # Reset all state variables
             self.positive_cache = None
             self.negative_cache = None
             self.model = None
             self.positive_past_len = 0
             self.negative_past_len = 0
-            
-            # Force garbage collection
             import gc
             gc.collect()
-            
             logger.info("ExLlamaV3 model unloaded successfully")
-            
         except Exception as e:
             logger.error(f"Error unloading ExLlamaV3: {e}")    
         
@@ -227,31 +151,17 @@ class VibeVoiceCausalLMOutputWithPast(BaseModelOutputWithPast):
 
 @dataclass
 class VibeVoiceGenerationOutput(ModelOutput):
-    """
-    Output type for VibeVoice generation.
-    
-    Args:
-        sequences (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-            The generated sequences. 
-        speech_outputs (`List[torch.FloatTensor]`, *optional*):
-            List of generated speech waveforms or latents for each speech segment.
-    """
     sequences: torch.LongTensor = None
     speech_outputs: Optional[List[torch.FloatTensor]] = None
     reach_max_step_sample: Optional[torch.BoolTensor] = None
 
 class VibeVoiceTokenConstraintProcessor(LogitsProcessor):
-    """Constrains token generation to only valid tokens during speech generation."""
-    
     def __init__(self, valid_token_ids: List[int], device: torch.device = None):
         self.valid_token_ids = torch.tensor(valid_token_ids, dtype=torch.long, device=device)
         
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        # Create a mask for valid tokens
         mask = torch.full_like(scores, float('-inf'))
         mask[:, self.valid_token_ids] = 0
-        
-        # Apply mask to scores
         scores = scores + mask
         return scores
     
@@ -261,26 +171,14 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
 
     def __init__(self, config):
         super().__init__(config)
-        
-        # Initialize the base model
         self.model = VibeVoiceModel(config)
-                
-        # LM head for text generation
         self.lm_head = nn.Linear(config.decoder_config.hidden_size, config.decoder_config.vocab_size, bias=False)
-        
-        # inference configuration
         self.ddpm_inference_steps = config.diffusion_head_config.ddpm_num_inference_steps
-
-        # NEW: Initialize exllama attribute
         self.exllama = None
-        
         self.negative_llm_steps_to_cache = 0
-        
         self.negative_outputs_stored = None
-        
         self.increase_cfg = False           
-        
-        # Initialize weights and apply final processing
+        self._cpp_automaton = None # <--- Our C++ Extension Worker Tracker
         self.post_init()        
 
     @property
@@ -314,15 +212,50 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
     @property
     def semantic_connector(self):
         return self.model.semantic_connector
+
+    def _get_cpp_automaton(self):
+        """Lazily initialize the C++ Diffusion Automaton"""
+        if self._cpp_automaton is not None:
+            return self._cpp_automaton
+            
+        self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
+        head = self.model.prediction_head
+        
+        # Unpack layers
+        norm_w, ffn_gate_w, ffn_up_w, ffn_down_w, adaln_w = [], [], [], [], []
+        for layer in head.layers:
+            norm_w.append(layer.norm.weight)
+            ffn_gate_w.append(layer.ffn.gate_proj.weight)
+            ffn_up_w.append(layer.ffn.up_proj.weight)
+            ffn_down_w.append(layer.ffn.down_proj.weight)
+            adaln_w.append(layer.adaLN_modulation[1].weight)
+            
+        # Get scheduler arrays safely
+        device = head.noisy_images_proj.weight.device
+        alpha_t = self.model.noise_scheduler.alpha_t.to(device).to(torch.float32)
+        sigma_t = self.model.noise_scheduler.sigma_t.to(device).to(torch.float32)
+        lambda_t = self.model.noise_scheduler.lambda_t.to(device).to(torch.float32)
+        timesteps_list = self.model.noise_scheduler.timesteps.tolist()
+
+        self._cpp_automaton = ext.VibeVoiceDiffusionWorker(
+            head.noisy_images_proj.weight,
+            head.cond_proj.weight,
+            head.t_embedder.mlp[0].weight,
+            head.t_embedder.mlp[2].weight,
+            head.final_layer.linear.weight,
+            head.final_layer.adaLN_modulation[1].weight,
+            norm_w, ffn_gate_w, ffn_up_w, ffn_down_w, adaln_w,
+            self.model.acoustic_connector.fc1.weight, self.model.acoustic_connector.fc1.bias,
+            self.model.acoustic_connector.norm.weight, 
+            self.model.acoustic_connector.fc2.weight, self.model.acoustic_connector.fc2.bias,
+            alpha_t, sigma_t, lambda_t, timesteps_list,
+            1e-5 # eps
+        )
+        return self._cpp_automaton
         
     def tie_weights(self):
-        """
-        Tie the weights between the input embeddings and the output embeddings.
-        """
-        # Tie lm_head.weight to language_model.embed_tokens.weight
         if not getattr(self.config, 'tie_word_embeddings', False):
             return
-         
         if hasattr(self, 'lm_head') and hasattr(self.model.language_model, 'embed_tokens'):
             self.lm_head.weight = self.model.language_model.embed_tokens.weight
         
@@ -339,42 +272,28 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         self.lm_head = new_embeddings
     
     def set_speech_tokenizers(self, acoustic_tokenizer=None, semantic_tokenizer=None):
-        """Set the speech tokenizers used for encoding and decoding speech."""
         self.model.set_speech_tokenizers(acoustic_tokenizer, semantic_tokenizer)
     
     def set_ddpm_inference_steps(self, num_steps=None):
         self.ddpm_inference_steps = num_steps or self.config.diffusion_head_config.ddpm_num_inference_steps
 
     def _process_speech_inputs(self, speech_tensors, speech_masks, speech_type="audio"):
-        """Process speech inputs through tokenizers and connectors."""
         with torch.no_grad():
             if speech_type == "audio":
-                # Encode audio to acoustic latents
                 encoder_output = self.model.acoustic_tokenizer.encode(speech_tensors.unsqueeze(1))
                 acoustic_latents = encoder_output.sample(dist_type=self.model.acoustic_tokenizer.std_dist_type)[0]
-                
-                # Apply scaling and bias
                 acoustic_features = (acoustic_latents + self.model.speech_bias_factor.to(acoustic_latents.device)) * self.model.speech_scaling_factor
-                
-                # Connect to language model space
                 acoustic_connected = self.model.acoustic_connector(acoustic_features)[speech_masks]
-                
                 return acoustic_features, acoustic_connected
             elif speech_type == "pt":
                 encoder_output = VibeVoiceTokenizerEncoderOutput(mean=speech_tensors, std=self.acoustic_tokenizer.config.fix_std)
                 acoustic_latents = encoder_output.sample(dist_type=self.model.acoustic_tokenizer.std_dist_type)[0]
-                
-                # Apply scaling and bias
                 acoustic_features = (acoustic_latents + self.model.speech_bias_factor.to(acoustic_latents.device)) * self.model.speech_scaling_factor
-                
-                # Connect to language model space
                 acoustic_connected = self.model.acoustic_connector(acoustic_features)[speech_masks]
-                
                 return acoustic_features, acoustic_connected
             else:
                 raise NotImplementedError(f"Speech type {speech_type} not implemented")
     
-    # @can_return_tuple
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -392,82 +311,54 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         speech_masks: Optional[torch.BoolTensor] = None,
         speech_input_mask: Optional[torch.BoolTensor] = None,
         logits_to_keep: Union[int, slice] = 0,
-        use_exllama: Optional[bool] = False,  # New parameter
-        past_len: Optional[int] = None,       # New parameter for ExLlama
-        use_negative_cache: Optional[bool] = False,  # New parameter to select cache
+        use_exllama: Optional[bool] = False,
+        past_len: Optional[int] = None, 
+        use_negative_cache: Optional[bool] = False, 
         **kwargs,
     ) -> Union[Tuple, VibeVoiceCausalLMOutputWithPast]:
-        """
-        Args:
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-            speech_tensors (`torch.FloatTensor`, *optional*):
-                Input speech waveforms for voice cloning or speech understanding.
-            speech_masks (`torch.BoolTensor`, *optional*):
-                Masks indicating valid speech frames.
-            speech_input_mask (`torch.BoolTensor`, *optional*):
-                Positions in the input sequence where speech embeddings should be inserted.
         
-        Returns:
-            `VibeVoiceCausalLMOutputWithPast` or tuple
-        """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict        
-
         logits_need_squeezing = False
         
-        # Handle ExLlama forward pass
         if use_exllama and self.exllama is not None:
-                        
-            # Get embeddings
             if inputs_embeds is None:
                 inputs_embeds = self.exllama.compute_inputs_embeds(input_ids)
                 logits_need_squeezing = True
             
-            # Process speech inputs if provided
             if speech_tensors is not None and speech_masks is not None:
                 acoustic_features, speech_embeds = self._process_speech_inputs(speech_tensors.to(self.dtype), speech_masks)
                 if speech_input_mask is not None:   
                     inputs_embeds = inputs_embeds.to(self.device)
                     inputs_embeds[speech_input_mask] = speech_embeds.float().to(self.device) 
             
-            # ExLlama handles embeddings internally
             if inputs_embeds is not None:
-                start_time = time.time()
                 logits, hidden_states = self.exllama.forward(
                     inputs_embeds=inputs_embeds,
                     position_ids=position_ids,
-                    use_negative_cache=use_negative_cache  # Add this parameter
+                    use_negative_cache=use_negative_cache
                 )                
             else:
-                # not called
-                print("if this is called, then logic if bad (we dont have inputs_embeds)")
-                logits, hidden_states = self.exllama.forward(
-                    input_ids=input_ids,
-                )
+                logits, hidden_states = self.exllama.forward(input_ids=input_ids)
+                
             if logits_need_squeezing:
                 logits = logits[:, -1:, :]     
             
             return VibeVoiceCausalLMOutputWithPast(
                 logits=logits,
-                past_key_values=past_key_values,  # ExLlama manages its own cache
+                past_key_values=past_key_values,
                 last_hidden_state=hidden_states.to(self.dtype),
-                attentions=None,  # ExLlama doesn't return attentions
+                attentions=None,
             )
         else:
-            # Get embeddings
             if inputs_embeds is None:
                 inputs_embeds = self.model.get_input_embeddings()(input_ids)
             
-            # Process speech inputs if provided
             if speech_tensors is not None and speech_masks is not None:
                 acoustic_features, speech_embeds = self._process_speech_inputs(speech_tensors.to(self.dtype), speech_masks)
                 if speech_input_mask is not None:
                     inputs_embeds[speech_input_mask] = speech_embeds         
 
             inputs_embeds = inputs_embeds.to(cache_position.device).to(self.dtype) 
-            start_time = time.time()
             outputs = self.model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
@@ -482,14 +373,8 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
             )  
 
             hidden_states = outputs[0] if not return_dict else outputs.last_hidden_state
-            # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
             slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
             logits = self.lm_head(hidden_states[:, slice_indices, :])
-                    
-            if labels is not None:
-                raise NotImplementedError("Loss computation is not implemented in this version.")
-
-       
             
             return VibeVoiceCausalLMOutputWithPast(
                 logits=logits,
@@ -514,8 +399,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
             )
 
         generation_config, model_kwargs = self._prepare_generation_config(
-            generation_config, 
-            True, 
+            generation_config, True, 
             speech_start_id=tokenizer.speech_start_id, 
             speech_end_id=tokenizer.speech_end_id, 
             speech_diffusion_id=tokenizer.speech_diffusion_id, 
@@ -592,16 +476,8 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         stop_check_fn: Optional[Callable[[], bool]] = None,        
         **kwargs,
     ) -> Union[torch.LongTensor, VibeVoiceGenerationOutput]:
-        """
-        Generates sequences of token ids and optionally speech outputs.
-        Optimized with Static Buffer Pre-allocation to reduce CPU overhead.
-        """
-        # Initialize cache and step counter
-        if not hasattr(self, 'negative_outputs_stored'):
-            self.negative_outputs_stored = None                  
-            
-        # 1. Handle `generation_config` and kwargs that might update it
-        tokenizer = kwargs.pop("tokenizer", None)
+        
+        tokenizer = kwargs.pop("tokenizer", None)  
         parsed_scripts = kwargs.pop("parsed_scripts", None)
         all_speakers_list = kwargs.pop("all_speakers_list", None)
         max_length_times = kwargs.pop("max_length_times", 2)
@@ -613,7 +489,6 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
             generation_config, inputs, tokenizer, return_processors=True, **kwargs
         )
         
-        # Negative prompt setup
         negative_kwargs = {
             'input_ids': torch.full((kwargs['input_ids'].shape[0], 1), tokenizer.speech_start_id, dtype=torch.long, device=kwargs['input_ids'].device),
             'attention_mask':  torch.ones((kwargs['input_ids'].shape[0], 1), dtype=torch.long, device=kwargs['input_ids'].device),
@@ -635,27 +510,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         verbose = kwargs.get("verbose", False)
 
         audio_chunks = [[] for _ in range(batch_size)]
-
-        # --- OPTIMIZATION: Static Buffer Allocation ---
         initial_length = input_ids.shape[-1]
-        max_gen_len = generation_config.max_length
-        
-        # Pre-allocate full sequence buffer on GPU to avoid torch.cat overhead
-        full_sequences = torch.full(
-            (batch_size, max_gen_len), 
-            generation_config.pad_token_id, 
-            dtype=torch.long, 
-            device=device
-        )
-        # Copy initial prompt into buffer
-        full_sequences[:, :initial_length] = input_ids
-        
-        # current_ids will hold just the input for the CURRENT step (shape [B, 1] after prefill)
-        current_ids = input_ids 
-        # Track length manually to avoid .shape calls
-        current_len = initial_length
-        # --- END OPTIMIZATION ---
-
         initial_length_per_sample = model_kwargs['attention_mask'].sum(dim=-1)
 
         valid_tokens = [
@@ -677,6 +532,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         reach_max_step_sample = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         use_exllama = self.exllama is not None        
+        cpp_automaton = self._get_cpp_automaton() if use_exllama else None
         
         if kwargs.get("show_progress_bar", True):
             progress_bar = tqdm(range(max_steps), desc="Generating", leave=False)
@@ -685,7 +541,8 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
         
         inference_time_start = time.time()
         for step in progress_bar:            
-            if stop_check_fn is not None: stop_check_fn()
+            if stop_check_fn is not None:
+                stop_check_fn()
             
             if audio_streamer is not None and hasattr(audio_streamer, 'finished_flags'):
                 if any(audio_streamer.finished_flags):                    
@@ -696,7 +553,7 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 if hasattr(progress_bar, 'set_description'): progress_bar.set_description("Generation complete")
                 break
 
-            if current_len >= generation_config.max_length:
+            if input_ids.shape[-1] >= generation_config.max_length:
                 print(f"Reached maximum generation length {generation_config.max_length}, stopped it.")
                 reached_samples = torch.arange(batch_size, device=device)[~finished_tags]
                 if reached_samples.numel() > 0:
@@ -707,25 +564,19 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 active_samples = (~finished_tags).sum().item()
                 progress_bar.set_description(f"Generating (active: {active_samples}/{batch_size})")
 
-            # Prepare model inputs using just the current tokens (not the whole history)
-            model_inputs = self.prepare_inputs_for_generation(current_ids, **model_kwargs)
-            
+            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             if is_prefill:
                 prefill_inputs = {
-                    "speech_tensors": speech_tensors.to(device=device),
-                    "speech_masks": speech_masks.to(device),
-                    "speech_input_mask": speech_input_mask.to(device),
+                    "speech_tensors": speech_tensors.to(device=device) if speech_tensors is not None else None,
+                    "speech_masks": speech_masks.to(device) if speech_masks is not None else None,
+                    "speech_input_mask": speech_input_mask.to(device) if speech_input_mask is not None else None,
                 }
                 is_prefill = False
             else:
                 _ = model_inputs.pop('inputs_embeds', None)
                 prefill_inputs = {'inputs_embeds': inputs_embeds}
 
-            # Calculate past_len based on our manual counter
-            if step == 0:
-                past_len = 0
-            else:
-                past_len = current_len - 1
+            past_len = 0 if step == 0 else input_ids.shape[-1] - 1
             
             outputs = self(
                 **model_inputs,
@@ -738,16 +589,9 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 past_len=past_len
             )            
             
-            model_kwargs = self._update_model_kwargs_for_generation(
-                outputs, model_kwargs, is_encoder_decoder=False,
-            )
-
-            next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=device)
-            
-            # OPTIMIZATION: Pass a View of the full sequence to logits processor 
-            # (instead of creating a new concatenated tensor)
-            history_view = full_sequences[:, :current_len]
-            next_token_scores = logits_processor(history_view, next_token_logits)
+            model_kwargs = self._update_model_kwargs_for_generation(outputs, model_kwargs, is_encoder_decoder=False)
+            next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+            next_token_scores = logits_processor(input_ids, next_token_logits)
             
             if generation_config.do_sample:
                 probs = nn.functional.softmax(next_token_scores, dim=-1)
@@ -756,59 +600,31 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 next_tokens = torch.argmax(next_token_scores, dim=-1)
             
             next_tokens[finished_tags] = generation_config.eos_token_id
+            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             
-            # --- OPTIMIZATION: In-place Update & Next Input Prep ---
-            # 1. Write result to static buffer
-            if current_len < max_gen_len:
-                full_sequences[:, current_len] = next_tokens
-            
-            # 2. Prepare input for next step (Just the new token, shape [B, 1])
-            current_ids = next_tokens[:, None]
-            
-            # 3. Increment length
-            current_len += 1
-            # -------------------------------------------------------
-            
-            # Negative Prompt Logic
-            if not kwargs.get('refresh_negative', True):
-                negative_model_inputs = self.prepare_inputs_for_generation(negative_input_ids, **negative_model_kwargs)
-                if negative_model_inputs['inputs_embeds'] is None and inputs_embeds is not None:
-                    negative_model_inputs['inputs_embeds'] = inputs_embeds
-                    negative_model_inputs['input_ids'] = None
-                
-                negative_outputs = self(
-                    **negative_model_inputs, logits_to_keep=0, return_dict=True, output_attentions=False, output_hidden_states=False,
-                )
-                negative_model_kwargs = self._update_model_kwargs_for_generation(
-                    negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
-                )
-                negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
-
-            # Check EOS
             if (next_tokens == generation_config.eos_token_id).any():
                 eos_indices = (next_tokens == generation_config.eos_token_id).nonzero(as_tuple=False).squeeze(1)
                 new_eos_indices = eos_indices[~finished_tags[eos_indices]]
                 if new_eos_indices.numel() > 0:
                     finished_tags[new_eos_indices] = True
                     if verbose: print(f"Samples {new_eos_indices.tolist()} reached EOS token at step {step + 1}.", flush=True)
-                    if audio_streamer is not None: audio_streamer.end(new_eos_indices)
+                    if audio_streamer is not None:
+                        audio_streamer.end(new_eos_indices)
 
-            # Check Max Length
             max_length_reached = step >= max_step_per_sample
             new_max_length_indices = torch.nonzero(max_length_reached & ~finished_tags, as_tuple=False).squeeze(1)
             if new_max_length_indices.numel() > 0:
                 finished_tags[new_max_length_indices] = True
                 reach_max_step_sample[new_max_length_indices] = True
                 if verbose: print(f"Samples {new_max_length_indices.tolist()} reached max generation length at step {step + 1}.", flush=True)
-                if audio_streamer is not None: audio_streamer.end(new_max_length_indices)
+                if audio_streamer is not None:
+                    audio_streamer.end(new_max_length_indices)
 
-            # Speech End
             diffusion_end_indices = (next_tokens == generation_config.speech_end_id).nonzero(as_tuple=False).squeeze(1)
             if diffusion_end_indices.numel() > 0:
                 acoustic_cache.set_to_zero(diffusion_end_indices)
                 semantic_cache.set_to_zero(diffusion_end_indices)
             
-            # Speech Start
             diffusion_start_indices = torch.arange(batch_size, device=device)[~finished_tags & (next_tokens == generation_config.speech_start_id)]
             if diffusion_start_indices.numel() > 0 and kwargs.get('refresh_negative', True):
                 for i, sample_idx in enumerate(diffusion_start_indices.tolist()):
@@ -822,13 +638,11 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                 for sample_idx in diffusion_start_indices.tolist():
                     negative_input_ids[sample_idx, -1] = generation_config.speech_start_id
             
-            # Prepare next embeddings
             if use_exllama:   
                 next_inputs_embeds = self.exllama.compute_inputs_embeds(next_tokens.unsqueeze(1))                
             else:
                 next_inputs_embeds = self.model.get_input_embeddings()(next_tokens).unsqueeze(1)
             
-            # Diffusion Process
             diffusion_indices = torch.arange(batch_size, device=device)[~finished_tags & (next_tokens == generation_config.speech_diffusion_id)]            
             
             if diffusion_indices.numel() > 0:
@@ -838,12 +652,13 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                         negative_model_inputs['inputs_embeds'] = inputs_embeds
                         negative_model_inputs['input_ids'] = None
 
-                    exl_past_len = self.exllama.negative_past_len if self.exllama is not None else 0
-                    
+                    past_len = self.exllama.negative_past_len if self.exllama is not None else 0
                     use_negative_cache = False                    
                     if step > 0 and self.negative_llm_steps_to_cache > 0:      
-                        if step % self.negative_llm_steps_to_cache == 0: use_negative_cache = False
-                        elif self.negative_outputs_stored is not None: use_negative_cache = True
+                        if step % self.negative_llm_steps_to_cache == 0:
+                            use_negative_cache = False
+                        elif self.negative_outputs_stored is not None:
+                            use_negative_cache = True
                     
                     if use_negative_cache == False:  
                         self.negative_outputs_stored = self(
@@ -853,28 +668,25 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                             output_attentions=False, 
                             output_hidden_states=False,
                             use_exllama=(self.exllama is not None),
-                            use_negative_cache=True,
-                            past_len=exl_past_len,                          
+                            use_negative_cache=True,  
+                            past_len=past_len, 
                         )
-                    negative_outputs = self.negative_outputs_stored         
-                    negative_model_kwargs = self._update_model_kwargs_for_generation(
-                        negative_outputs, negative_model_kwargs, is_encoder_decoder=False,
-                    )
+                    negative_outputs = self.negative_outputs_stored  
+                    negative_model_kwargs = self._update_model_kwargs_for_generation(negative_outputs, negative_model_kwargs, is_encoder_decoder=False)
                     negative_input_ids = torch.cat([negative_input_ids, next_tokens[:, None]], dim=-1)
 
                 non_diffusion_mask = ~finished_tags & (next_tokens != generation_config.speech_diffusion_id)
                 if non_diffusion_mask.any():
                     non_diffusion_indices = torch.arange(batch_size, device=device)[non_diffusion_mask]
                     start_indices = correct_cnt[non_diffusion_indices]
+
                     seq_len = negative_model_kwargs['attention_mask'].shape[1]
                     for i, (sample_idx, start_idx) in enumerate(zip(non_diffusion_indices.tolist(), start_indices.tolist())):
                         if start_idx + 1 < seq_len - 1:
-                            negative_model_kwargs['attention_mask'][sample_idx, start_idx+1:] = \
-                                negative_model_kwargs['attention_mask'][sample_idx, start_idx:-1].clone()
+                            negative_model_kwargs['attention_mask'][sample_idx, start_idx+1:] = negative_model_kwargs['attention_mask'][sample_idx, start_idx:-1].clone()
                         negative_model_kwargs['attention_mask'][sample_idx, start_idx] = 0
 
-                    for layer_idx, (k_cache, v_cache) in enumerate(zip(negative_model_kwargs['past_key_values'].key_cache, 
-                                                                        negative_model_kwargs['past_key_values'].value_cache)):
+                    for layer_idx, (k_cache, v_cache) in enumerate(zip(negative_model_kwargs['past_key_values'].key_cache, negative_model_kwargs['past_key_values'].value_cache)):
                         for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
                             if start_idx + 1 < k_cache.shape[2] - 1:
                                 k_cache[sample_idx, :, start_idx+1:, :] = k_cache[sample_idx, :, start_idx:-1, :].clone()
@@ -882,20 +694,62 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                     
                     for sample_idx, start_idx in zip(non_diffusion_indices.tolist(), start_indices.tolist()):
                         if start_idx + 1 < negative_input_ids.shape[1] - 1:
-                            negative_input_ids[sample_idx, start_idx+1:] = \
-                                negative_input_ids[sample_idx, start_idx:-1].clone()
+                            negative_input_ids[sample_idx, start_idx+1:] = negative_input_ids[sample_idx, start_idx:-1].clone()
                                 
                     correct_cnt[non_diffusion_indices] += 1
-                
+
                 positive_condition = outputs.last_hidden_state[diffusion_indices, -1, :]
                 negative_condition = negative_outputs.last_hidden_state[diffusion_indices, -1, :]                
                 
-                speech_latent = self.sample_speech_tokens(
-                    positive_condition,
-                    negative_condition,
-                    cfg_scale=cfg_scale,
-                    increase_cfg=self.increase_cfg,
-                ).unsqueeze(1) 
+# ==== C++ EXLLAMAV3 EXTENSION ACCELERATION ====
+                if use_exllama and cpp_automaton is not None:
+                    
+                    # --- DEEP TELEMETRY SETUP ---
+                    if not hasattr(self, "_dbg_stats"):
+                        self._dbg_stats = {"calls": 0, "last_time": time.perf_counter()}
+                    
+                    # Measure how long Python took to get here (LLM step + Overhead)
+                    torch.cuda.synchronize() # Wait for LLM to finish before clocking
+                    t_cpp_start = time.perf_counter()
+                    py_overhead_duration = (t_cpp_start - self._dbg_stats["last_time"]) * 1000 # ms
+                    
+                    # --- 1st Knock: Diffusion & CFG ---
+                    # Pointers only. No data transferred over PCIe.
+                    speech_latent = cpp_automaton.sample(
+                        positive_condition,
+                        negative_condition,
+                        float(cfg_scale),
+                        True,
+                        bool(self.increase_cfg)
+                    ) # [B, 1, 64]
+                    
+                    # --- 2nd Knock: Acoustic Connector ---
+                    acoustic_embed = cpp_automaton.acoustic_connector_forward(speech_latent.squeeze(1)).unsqueeze(1)
+                    
+                    # Sync to measure exact GPU execution time
+                    torch.cuda.synchronize() 
+                    t_cpp_end = time.perf_counter()
+                    cpp_duration = (t_cpp_end - t_cpp_start) * 1000 # ms
+                    
+                    self._dbg_stats["calls"] += 1
+                    
+                    if verbose or self._dbg_stats["calls"] % 10 == 0:
+                        pct_cpp = (cpp_duration / (cpp_duration + py_overhead_duration)) * 100 if (cpp_duration + py_overhead_duration) > 0 else 0
+                        print(f"\n[Telemetry] Token {step+1} | "
+                              f"Python LLM logic: {py_overhead_duration:.2f} ms | "
+                              f"C++ Automaton (20 loops): {cpp_duration:.2f} ms ({pct_cpp:.1f}% of total) | "
+                              f"PCIe Data: 0 bytes", flush=True)
+                              
+                    # Reset clock for next Python cycle
+                    self._dbg_stats["last_time"] = time.perf_counter()
+
+                else:
+                    speech_latent = self.sample_speech_tokens(
+                        positive_condition,
+                        negative_condition,
+                        cfg_scale=cfg_scale,
+                        increase_cfg=self.increase_cfg,
+                    ).unsqueeze(1) 
                                 
                 scaled_latent = speech_latent / self.model.speech_scaling_factor.to(speech_latent.device) - self.model.speech_bias_factor.to(speech_latent.device)
                 audio_chunk = self.model.acoustic_tokenizer.decode(
@@ -920,13 +774,18 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
                     sample_indices=diffusion_indices,
                     use_cache=True,
                     debug=False
-                ).mean
+                ).mean 
                 
-                acoustic_embed = self.model.acoustic_connector(speech_latent)
+                # ==== C++ EXLLAMAV3 EXTENSION ACCELERATION ====
+                if use_exllama and cpp_automaton is not None:
+                    acoustic_embed = cpp_automaton.acoustic_connector_forward(speech_latent.squeeze(1)).unsqueeze(1)
+                else:
+                    acoustic_embed = self.model.acoustic_connector(speech_latent)
+                    
                 semantic_embed = self.model.semantic_connector(semantic_features)
                 diffusion_embeds = acoustic_embed + semantic_embed
-
                 diffusion_embeds = diffusion_embeds.to(next_inputs_embeds.dtype)
+
                 next_inputs_embeds = next_inputs_embeds.to(diffusion_indices.device)
                 next_inputs_embeds[diffusion_indices] = diffusion_embeds
             
@@ -948,244 +807,37 @@ class VibeVoiceForConditionalGenerationInference(VibeVoicePreTrainedModel, Gener
             self.exllama.reset_all()
         
         return VibeVoiceGenerationOutput(
-            # Return sliced sequence (exclude padding)
-            sequences=full_sequences[:, :current_len],
+            sequences=input_ids,
             speech_outputs=final_audio_outputs if return_speech else None,
             reach_max_step_sample=reach_max_step_sample,
         )
     
     @torch.no_grad()
-    # not used
-    def original_sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0):
+    def sample_speech_tokens(self, condition, neg_condition, cfg_scale=1.3, increase_cfg=False):
         self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
-        condition = torch.cat([condition, neg_condition], dim=0).to(self.model.prediction_head.device)
-        speech = torch.randn(condition.shape[0], self.config.acoustic_vae_dim).to(condition)
-        for t in self.model.noise_scheduler.timesteps:
-            half = speech[: len(speech) // 2]
-            combined = torch.cat([half, half], dim=0)
-            eps = self.model.prediction_head(combined, t.repeat(combined.shape[0]).to(combined), condition=condition)
-            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-            half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-            eps = torch.cat([half_eps, half_eps], dim=0)
-            speech = self.model.noise_scheduler.step(eps, t, speech).prev_sample
-        return speech[: len(speech) // 2]
-        
-    
-    # from deepseek, corrected by gemini. not fast
-    # NOT USED
-    @torch.no_grad()
-    def deepseek_with_gemini_sample_speech_tokens(self, condition, neg_condition, cfg_scale=3.0, cache_every_n_steps=2):
-        """
-        Generates speech tokens with an optimized caching strategy for the unconditional prediction.
-
-        Args:
-            condition: The positive conditioning tensor.
-            neg_condition: The negative conditioning tensor.
-            cfg_scale (float): The scale for classifier-free guidance.
-            cache_every_n_steps (int): How many steps to reuse the unconditional prediction for.
-                                       - 1: No caching (original behavior).
-                                       - 2: Recalculate uncond every 2 steps (saves ~25% of model compute).
-                                       - 4: Recalculate uncond every 4 steps (saves ~37.5% of model compute).
-        """
-        self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
-        device = self.model.prediction_head.device
-        dtype = self.model.prediction_head.dtype
-
-        # Prepare conditioning tensors once
-        pos_condition = condition.to(device=device, dtype=dtype)
-        neg_condition = neg_condition.to(device=device, dtype=dtype)
-
-        # Initialize noise for the batch
-        batch_size = condition.shape[0]
-        speech = torch.randn(batch_size, self.config.acoustic_vae_dim, device=device, dtype=dtype)
-
-        uncond_eps_cached = None
-
-        for i, t in enumerate(self.model.noise_scheduler.timesteps):
-            # Create a batch of timesteps
-            t_batch = t.repeat(batch_size).to(device=device, dtype=dtype)
-
-            # Determine if we need to recalculate the unconditional prediction
-            if i % cache_every_n_steps == 0:
-                # --- FULL PASS ---
-                # Recalculate both predictions by running the model on a combined batch
-                speech_input = torch.cat([speech, speech], dim=0)
-                t_input = t.repeat(speech_input.shape[0]).to(device=device, dtype=dtype)
-                condition_input = torch.cat([pos_condition, neg_condition], dim=0)
-                
-                eps_both = self.model.prediction_head(speech_input, t_input, condition=condition_input)
-                cond_eps, uncond_eps = torch.split(eps_both, batch_size, dim=0)
-
-                # Cache the unconditional prediction
-                uncond_eps_cached = uncond_eps.detach()
-            else:
-                # --- HALF PASS (FASTER) ---
-                # Reuse the cached unconditional prediction and only compute the conditional one
-                cond_eps = self.model.prediction_head(speech, t_batch, condition=pos_condition)
-                uncond_eps = uncond_eps_cached
-
-            # Apply guidance (I've included your dynamic CFG logic)
-            current_cfg = cfg_scale * (1.0 + 0.5 * (i < 5)) # Boost CFG for early steps
-            cfg_eps = uncond_eps + current_cfg * (cond_eps - uncond_eps)
-            
-            # Take a step with the scheduler
-            speech = self.model.noise_scheduler.step(cfg_eps, t, speech).prev_sample
-                
-        return speech
-        
-    # from gemini. a little faster
-    # NOT USED
-    @torch.no_grad()
-    def gemi_sample_speech_tokens(self, condition, neg_condition, cfg_scale=1.3):
-        self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
-        
-        # Determine the actual batch size from the condition tensor
         batch_size = condition.shape[0]
         device = self.model.prediction_head.device
         dtype = self.model.prediction_head.dtype
-        
-        # 1. Combine conditions for a single model pass
         conditions = torch.cat([condition, neg_condition], dim=0).to(device=device, dtype=dtype)
+        speech = torch.randn((batch_size, self.config.acoustic_vae_dim), device=device, dtype=dtype)
+        total_steps = len(self.model.noise_scheduler.timesteps)
         
-        # 2. Start with one batch of random noise (the eventual output)
-        speech = torch.randn(
-            (batch_size, self.config.acoustic_vae_dim),
-            device=device,
-            dtype=dtype  # Use the same dtype as your model
-        )
-
-        # Use 'cuda' if available, otherwise 'cpu'
-        device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-        for t in self.model.noise_scheduler.timesteps:
-            # 3. Expand the latents to run both cond and uncond simultaneously
+        for i, t in enumerate(self.model.noise_scheduler.timesteps):
             latent_model_input = torch.cat([speech] * 2).to(dtype)
-
-            # Some schedulers require scaling the input, check your scheduler's docs
-            # latent_model_input = self.model.noise_scheduler.scale_model_input(latent_model_input, t)
-            
-            # Use Automatic Mixed Precision (torch.amp) for a speed boost
-            # It uses faster FP16/BF16 operations where possible
-            #with torch.amp.autocast(device_type=device_type, dtype=torch.float16):
-            # 4. Predict the velocity for both conditions
             model_output = self.model.prediction_head(
                 latent_model_input,
                 t.repeat(latent_model_input.shape[0]).to(latent_model_input),
                 condition=conditions
             )
-
-            # 5. Split predictions and apply CFG
             cond_pred, uncond_pred = model_output.chunk(2)
-            guided_pred = uncond_pred + cfg_scale * (cond_pred - uncond_pred)
-            
-            # 6. Use the guided prediction to step the original single latent
-            speech = self.model.noise_scheduler.step(guided_pred, t, speech).prev_sample
-            
-        return speech
-    
-    # used
-    @torch.no_grad()
-
-    def sample_speech_tokens(self, condition, neg_condition, cfg_scale=1.3, increase_cfg=False):
-        self.model.noise_scheduler.set_timesteps(self.ddpm_inference_steps)
-        
-        batch_size = condition.shape[0]
-        device = self.model.prediction_head.device
-        dtype = self.model.prediction_head.dtype
-        
-        # 1. Combine conditions (Static Shape)
-        conditions = torch.cat([condition, neg_condition], dim=0).to(device=device, dtype=dtype)
-        
-        # 2. Initialize Latents
-        speech = torch.randn(
-            (batch_size, self.config.acoustic_vae_dim),
-            device=device,
-            dtype=dtype
-        )
-
-        total_steps = len(self.model.noise_scheduler.timesteps)
-        
-        # --- PRE-ALLOCATION OPTIMIZATION (Fixes PCIe x1 Bottleneck) ---
-        # Pre-calculate all timestep tensors on GPU to avoid CPU->GPU transfer in loop
-        timesteps_gpu = [
-            t.repeat(batch_size * 2).to(device=device, dtype=dtype)
-            for t in self.model.noise_scheduler.timesteps
-        ]
-        
-        # Pre-allocate the input buffer for the model to avoid torch.cat overhead
-        latent_input_buffer = torch.empty(
-            (batch_size * 2, self.config.acoustic_vae_dim),
-            device=device,
-            dtype=dtype
-        )
-        
-        # --- GRAPH INITIALIZATION ---
-        if not hasattr(self, "_diffusion_graph_runner"):
-            
-            class GraphableBlock(torch.nn.Module):
-                def __init__(self, parent):
-                    super().__init__()
-                    self.head = parent.model.prediction_head
-                    self.register_buffer("cfg", torch.tensor(1.0)) # buffer for dynamic CFG
-                
-                def forward(self, x_in, t_in, c_in):
-                    # x_in is duplicated [sample, sample]
-                    # c_in is [pos, neg]
-                    
-                    # 1. Heavy Compute (The Model)
-                    model_out = self.head(x_in, t_in, condition=c_in)
-                    
-                    # 2. The CFG Math (Fused into graph to save kernel launches)
-                    cond_pred, uncond_pred = model_out.chunk(2)
-                    guided = uncond_pred + self.cfg * (cond_pred - uncond_pred)
-                    return guided
-
-            # Create the block
-            self._graph_block = GraphableBlock(self).to(device).to(dtype)
-            
-            # Setup dummy inputs for capture
-            # Fill the buffer for capture
-            latent_input_buffer[:batch_size].copy_(speech)
-            latent_input_buffer[batch_size:].copy_(speech)
-            
-            dummy_t = timesteps_gpu[0] # Use pre-allocated GPU tensor
-            
-            # Capture!
-            print(f"[VibeVoice] Capturing CUDA Graph for Diffusion Step (BS={batch_size})...")
-            self._diffusion_graph_runner = CUDAGraphRunner(
-                self._graph_block, 
-                (latent_input_buffer, dummy_t, conditions)
-            )
-            print("[VibeVoice] Graph captured successfully.")
-
-        # --- THE LOOP ---
-        for i, t_input_gpu in enumerate(timesteps_gpu):
-            # Prepare inputs efficiently (D2D copy, no CPU alloc)
-            # Equivalent to: latent_input = torch.cat([speech] * 2)
-            latent_input_buffer[:batch_size].copy_(speech)
-            latent_input_buffer[batch_size:].copy_(speech)
-            
-            # Calculate Dynamic CFG Scale
             if increase_cfg:
                 progress = i / total_steps
-                current_scale = cfg_scale * (1.0 + 0.5 * (progress < 0.5))
+                current_cfg_scale = cfg_scale * (1.0 + 0.5 * (progress < 0.5)) 
             else:
-                current_scale = cfg_scale
-            
-            # Update the CFG scalar in the graph block
-            self._graph_block.cfg.copy_(torch.tensor(current_scale, device=device))
-            
-            # EXECUTE GRAPH
-            # Uses pre-allocated t_input_gpu so no data travels PCIe
-            guided_pred = self._diffusion_graph_runner(latent_input_buffer, t_input_gpu, conditions)
-            
-            # Scheduler Step (Left in Python/PyTorch)
-            # t is needed for scheduler math on CPU side logic, access from scheduler list
-            t_orig = self.model.noise_scheduler.timesteps[i]
-            speech = self.model.noise_scheduler.step(guided_pred, t_orig, speech).prev_sample
-            
-        return speech   
-    
+                current_cfg_scale = cfg_scale
+            guided_pred = uncond_pred + current_cfg_scale * (cond_pred - uncond_pred)
+            speech = self.model.noise_scheduler.step(guided_pred, t, speech).prev_sample
+        return speech    
 
 AutoModelForCausalLM.register(VibeVoiceConfig, VibeVoiceForConditionalGenerationInference)
 
