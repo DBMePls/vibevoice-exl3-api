@@ -70,13 +70,13 @@ def run_debugger(args):
     print_header("VIBEVOICE HARDWARE BOTTLENECK PROFILER")
 
     # Override config with args if provided
-    if args.diffusion_model_path:
-        CONFIG.diffusion_model_path = args.diffusion_model_path
-    if args.llm_model_path:
-        CONFIG.llm_model_path = args.llm_model_path
+    if args.diffusion-model-path:
+        CONFIG.diffusion-model-path = args.diffusion-model-path
+    if args.llm-model-path:
+        CONFIG.llm-model-path = args.llm-model-path
 
-    print(f"[INFO] Target LLM: {CONFIG.llm_model_path}")
-    print(f"[INFO] Target DiT: {CONFIG.diffusion_model_path}")
+    print(f"[INFO] Target LLM: {CONFIG.llm-model-path}")
+    print(f"[INFO] Target DiT: {CONFIG.diffusion-model-path}")
     print("[INFO] Loading engine... (This takes a few seconds)")
     
     t0 = time.perf_counter()
