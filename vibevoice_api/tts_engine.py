@@ -131,6 +131,7 @@ def synthesize(
     cache_neg = None
     
     with torch.inference_mode():
+        # Setup Main Positive Cache
         cache_pos = _create_cache(engine.model, max_num_tokens=8192)
 
         # Setup Negative State
@@ -198,8 +199,8 @@ def synthesize(
                         accumulated_neg_embeds.append(step_embed_dtype)
                         steps_since_neg_update += 1
                         
-                        # Once we exceed the wait threshold, fire a batched update
-                        if steps_since_neg_update > neg_cache_steps:
+                        # Once we hit the caching threshold, fire a batched update
+                        if steps_since_neg_update >= neg_cache_steps:
                             # Concat on GPU (Zero CPU overhead)
                             neg_embed_batch = torch.cat(accumulated_neg_embeds, dim=1)
                             
