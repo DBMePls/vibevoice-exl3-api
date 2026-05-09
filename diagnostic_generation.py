@@ -7,8 +7,9 @@ import numpy as np
 import subprocess
 import logging
 import traceback
+import gc
 
-print("\n>>> BOOTING HARDWARE MICRO-PROFILER (MULTI-CHUNK TESTER)...", flush=True)
+print("\n>>> BOOTING HEAVY-DUTY MICRO-PROFILER...", flush=True)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 sys.path.insert(0, os.getcwd())
@@ -48,13 +49,13 @@ def run_debugger():
         chunk_sizes_to_test = [1, 2, 4, 8, 16, 32, 64]
         cfg = 1.3
         use_cfg = True
-        seed = 42 # Fixed seed guarantees exact same audio length every run
+        seed = 999 # Fixed seed for 1:1 comparison
         max_frames = 1500
         cache_len = 8192
         
         print_header("1. ENVIRONMENT & SETTINGS")
-        print(f"DiT Model Path:    {os.environ.get('VIBEVOICE_DIFFUSION_MODEL', 'Not Set (Using defaults)')}")
-        print(f"LLM Model Path:    {os.environ.get('VIBEVOICE_LLM_MODEL', 'Not Set (Using defaults)')}")
+        print(f"DiT Model Path:    {os.environ.get('VIBEVOICE_DIFFUSION_MODEL', 'Not Set')}")
+        print(f"LLM Model Path:    {os.environ.get('VIBEVOICE_LLM_MODEL', 'Not Set')}")
         print(f"Chunk Sizes:       {chunk_sizes_to_test}")
         print(f"Fixed Seed:        {seed} (Ensures 1:1 comparison)", flush=True)
 
@@ -64,7 +65,14 @@ def run_debugger():
         print(f"Hardware Device:   {device}")
         print(f"[TIME] Engine loaded in {(time.perf_counter()-t0):.2f} seconds.", flush=True)
 
-        text = "This is a hardware profiler test. We are tracking exact CPU and GPU timing to eliminate all bottlenecks."
+        # --- HEAVY LONG-FORM PROMPT ---
+        text = (
+            "This is a comprehensive stress test of the Vibe Voice generation system. "
+            "We are using a much longer prompt containing multiple sentences to ensure that the hardware is fully saturated. "
+            "By generating a significant amount of audio, we can accurately measure the true impact of PCIe synchronization latency "
+            "versus the penalty of overshooting."
+        )
+        
         voice_path = os.path.join(os.getcwd(), "demo", "voices", "en-Alice_woman.wav")
         if not os.path.exists(voice_path):
             print(f"\n[CRITICAL ERROR] Cannot find audio file at {voice_path}!")
@@ -106,7 +114,7 @@ def run_debugger():
                 cache_pos = _create_cache(engine.model, max_num_tokens=cache_len)
 
                 try:
-                    # Prefill (Must be redone per run because KV cache is wiped)
+                    # Prefill
                     inputs_embeds_pos = engine.model.modules[0].forward(input_ids, {"indexed_embeddings": [voice_mme]})
                     params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": 0, "batch_shape": (1, cache_len)}
                     logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=inputs_embeds_pos, params=params_pos)
@@ -161,7 +169,6 @@ def run_debugger():
                         t_cpu_end = time.perf_counter()
                         total_cpu_queue_time += (t_cpu_end - t_cpu_start)
                         
-                        # Only print progress periodically for small chunks to avoid console lag
                         if chunk_size >= 8 or (chunk_start % 8 == 0):
                             sys.stdout.write("#")
                             sys.stdout.flush()
@@ -223,14 +230,15 @@ def run_debugger():
                 "wasted_time": overshoot_time_waste
             })
             
-            print(f"Wall Time: {total_wall_time:.3f}s | GPU Math: {total_gpu_time:.3f}s | RTF: {rtf:.2f}x")
+            print(f"Wall Time: {total_wall_time:.3f}s | GPU Math: {total_gpu_time:.3f}s | RTF: {rtf:.3f}x")
 
-            # Clean memory before next run
-            del all_latents, latents, audio_tensor, cache_pos
+            # Deep clean memory before next run to prevent OOM
+            del all_latents, latents, audio_tensor, cache_pos, ev_starts, ev_ends
+            gc.collect()
             torch.cuda.empty_cache()
 
         # --- FINAL REPORT ---
-        print_header("FINAL CHUNK SIZE COMPARISON TABLE")
+        print_header("FINAL HEAVY-DUTY CHUNK SIZE COMPARISON TABLE")
         print(f"{'Chunk':<7} | {'RTF':<7} | {'Wall Time':<11} | {'GPU Math Time':<15} | {'PCIe Sync':<11} | {'Micro-Stalls':<14} | {'Garbage Waste':<15}")
         print("-" * 95)
         
@@ -245,11 +253,16 @@ def run_debugger():
             print(f"{m['chunk']:<7} | {m['rtf']:<6.3f}x | {m['wall_time']:<8.3f} s | {m['gpu_time']:<10.3f} s | {m['pcie_sync']:<6.4f} s | {m['cpu_stalls']:<9.5f} s | {m['wasted_frames']:<2} fr ({m['wasted_time']:<5.3f}s)")
 
         print("-" * 95)
-        print(f"\n[WINNER] The optimal chunk_size for your hardware is: {best_chunk} (RTF: {best_rtf:.3f}x)")
-        print(f"-> Set `chunk_size = {best_chunk}` in `vibevoice_api/tts_engine.py` to maximize your API performance.\n")
+        print(f"\n[WINNER] The optimal chunk_size for your hardware on LONG generations is: {best_chunk} (RTF: {best_rtf:.3f}x)")
+        
+        if best_chunk == 1:
+            print("-> CONCLUSION: Your Celeron handles Python dispatch so fast that overshooting is NEVER mathematically worth it.")
+        else:
+            print(f"-> CONCLUSION: The Celeron struggles on long generations. Grouping {best_chunk} frames hides the CPU bottleneck perfectly.")
 
         import soundfile as sf
-        sf.write("debugger_output_cpp.wav", final_wav, 24000)
+        sf.write("debugger_long_output.wav", final_wav, 24000)
+        print("\nSaved output audio to debugger_long_output.wav")
 
     except Exception as e:
         print("\n[CRITICAL FAILURE] The profiler crashed with the following error:")
