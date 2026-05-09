@@ -28,7 +28,7 @@ class ServerConfig:
     sample_rate: int = int(os.environ.get("VIBEVOICE_SAMPLE_RATE", "24000"))
     ddpm_steps: int = int(os.environ.get("VIBEVOICE_DDPM_STEPS", "16"))
     cfg_scale: float = float(os.environ.get("VIBEVOICE_CFG_SCALE", "1.3"))
-    seed: int = int(os.environ.get("VIBEVOICE_SEED", "-1")) # -1 for random
+    seed: int = int(os.environ.get("VIBEVOICE_SEED", "42")) # -1 for random
     use_sampling: bool = os.environ.get("VIBEVOICE_USE_SAMPLING", "false").lower() in ("true", "1", "yes")
     temperature: float = float(os.environ.get("VIBEVOICE_TEMPERATURE", "0.95"))
     top_p: float = float(os.environ.get("VIBEVOICE_TOP_P", "0.95"))
@@ -36,7 +36,7 @@ class ServerConfig:
     # -------------------------------------------------------------------------
     # NEW DEFAULT: 4 (Lazy Mini-Prefill for the negative CFG state)
     # -------------------------------------------------------------------------
-    negative_llm_steps_to_cache: int = int(os.environ.get("VIBEVOICE_NEG_CACHE_STEPS", "2"))
+    negative_llm_steps_to_cache: int = int(os.environ.get("VIBEVOICE_NEG_CACHE_STEPS", "1"))
     
     increase_cfg: bool = os.environ.get("VIBEVOICE_INCREASE_CFG", "false").lower() in ("true", "1", "yes")
     split_by_newline: bool = os.environ.get("VIBEVOICE_SPLIT_TEXT", "false").lower() in ("true", "1", "yes")
