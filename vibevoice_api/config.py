@@ -36,7 +36,7 @@ class ServerConfig:
     # -------------------------------------------------------------------------
     # NEW DEFAULT: 4 (Lazy Mini-Prefill for the negative CFG state)
     # -------------------------------------------------------------------------
-    negative_llm_steps_to_cache: int = int(os.environ.get("VIBEVOICE_NEG_CACHE_STEPS", "4"))
+    negative_llm_steps_to_cache: int = int(os.environ.get("VIBEVOICE_NEG_CACHE_STEPS", "2"))
     
     increase_cfg: bool = os.environ.get("VIBEVOICE_INCREASE_CFG", "false").lower() in ("true", "1", "yes")
     split_by_newline: bool = os.environ.get("VIBEVOICE_SPLIT_TEXT", "false").lower() in ("true", "1", "yes")
