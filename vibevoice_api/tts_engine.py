@@ -23,7 +23,6 @@ _engine_instance = None
 
 
 def load_audio_norm(path_or_bytes) -> np.ndarray:
-    """Loads and strictly normalizes audio to -25dBFS just like upstream VibeVoice"""
     if isinstance(path_or_bytes, bytes):
         wav, sr = sf.read(io.BytesIO(path_or_bytes), dtype="float32")
     else:
@@ -106,7 +105,7 @@ def synthesize(
         
     if not audio_source: raise ValueError("Could not resolve reference voice.")
         
-    # 2. Encode Real Human Voice (Moved to CPU for ExLlamaV3 text-stitching)
+    # 2. Encode Real Human Voice
     wav_norm = load_audio_norm(audio_source)
     with torch.inference_mode():
         device = engine.model.output_device or "cuda:0"
@@ -128,6 +127,9 @@ def synthesize(
     seed = seed if seed is not None and seed != -1 else int(time.time())
     increase_cfg = increase_cfg if increase_cfg is not None else CONFIG.increase_cfg
     
+    t_start = time.perf_counter()
+    tokens_gen = 0
+    
     with torch.inference_mode():
         # 4. Static Negative CFG condition
         if use_cfg:
@@ -148,43 +150,37 @@ def synthesize(
             
             past_len = inputs_embeds_pos.shape[1]
             all_latents = []
-            log.info("Starting autoregressive diffusion loop (Pipelined)...")
             
-            # 6. Pipelined AR Loop (Solves CPU Chit-Chat)
-            chunk_size = 30  # Number of frames the CPU will queue onto the GPU at once
+            # 6. Pipelined AR Loop
+            chunk_size = 30
             eos_flag = torch.zeros(1, dtype=torch.bool, device=device)
             
             for chunk_start in range(0, 1500, chunk_size):
                 chunk_latents = []
                 chunk_preds = []
                 
-                # The Celeron queues this entire loop into CUDA instantly without waiting.
+                # CPU queues jobs instantly
                 for t in range(chunk_start, min(chunk_start + chunk_size, 1500)):
                     cond_pos = hidden_last_pos[:, -1:, :].half()
                     
-                    # DiT (C++)
                     z = engine.model.worker.sample_latent(cond_pos, cond_neg if use_cfg else cond_pos, cfg, seed + t, increase_cfg)
                     chunk_latents.append(z)
                     
-                    # Acoustic Connector (C++)
                     step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
                     
-                    # LLM Step (C++ Kernels via Python dispatch)
                     params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
                     logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
                     past_len += 1
+                    tokens_gen += 1
                     
-                    # Async EOS Check (NO .item() inside the inner loop!)
                     pred_id = logits_pos[0, -1, :].argmax()
                     chunk_preds.append(pred_id)
                     eos_flag.logical_or_(pred_id == engine.speech_end_id)
                 
                 all_latents.extend(chunk_latents)
                 
-                # Single PCIe Sync Point per chunk. 
-                # This drops CPU<->GPU communication overhead by ~97%
+                # The single PCIe sync point
                 if eos_flag.item():
-                    # Find exact EOS frame to trim any over-generated garbage latents
                     preds_cpu = torch.stack(chunk_preds).cpu()
                     eos_indices = (preds_cpu == engine.speech_end_id).nonzero(as_tuple=True)[0]
                     if len(eos_indices) > 0:
@@ -192,6 +188,7 @@ def synthesize(
                         trim_count = len(chunk_preds) - first_eos_idx - 1
                         if trim_count > 0:
                             all_latents = all_latents[:-trim_count]
+                            tokens_gen -= trim_count
                     break
         finally:
             _destroy_cache(cache_pos, engine.model)
@@ -226,6 +223,15 @@ def synthesize(
     max_val = np.max(np.abs(wav))
     if max_val > 0.95:
         wav = wav / (max_val / 0.95)
+
+    # Calculate and Log Metrics!
+    t_end = time.perf_counter()
+    gen_time = t_end - t_start
+    audio_duration = len(wav) / CONFIG.sample_rate
+    rtf = audio_duration / gen_time if gen_time > 0 else 0
+    fps = tokens_gen / gen_time if gen_time > 0 else 0
+    
+    log.info(f"Synthesized {audio_duration:.2f}s audio in {gen_time:.2f}s. RTF: {rtf:.2f}x | {fps:.1f} frames/s")
 
     data, content_type = to_bytes_for_format(wav, CONFIG.sample_rate, response_format)
     return data, content_type

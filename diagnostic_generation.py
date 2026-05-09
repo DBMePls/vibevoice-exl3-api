@@ -1,80 +1,38 @@
-# --- START OF FILE diagnostic_generation.py ---
+# --- START OF FILE vibevoice_api/tts_engine.py ---
+from __future__ import annotations
 import os
-import sys
-import time
 import torch
 import numpy as np
-import subprocess
+import logging
+import io
+import time
+import base64
+from typing import Optional, Tuple, List, AsyncIterator
+
 import soundfile as sf
+import librosa
 
-# Ensure we are in the root directory
-sys.path.insert(0, os.getcwd())
-
-from vibevoice_api import tts_engine
-from exllamav3 import Cache
+from vibevoice_api.config import CONFIG
+from vibevoice_api.audio_utils import apply_speed, to_bytes_for_format
+from vibevoice_api.voice_map import VoiceMapper
+from exllamav3 import Config, Model, Cache, Tokenizer
 from exllamav3.tokenizer import MMEmbedding
 
-# --- CACHE HELPERS ---
-def _create_cache(model, max_num_tokens):
-    cache = Cache(model, max_num_tokens=max_num_tokens)
-    for module in model.get_cache_layers():
-        layer = cache.layers[module.layer_idx]
-        layer.alloc(module.device)
-    return cache
+log = logging.getLogger("vibevoice_api.tts_engine")
+_engine_instance = None
 
-def _destroy_cache(cache, model):
-    for module in model.get_cache_layers():
-        layer = cache.layers[module.layer_idx]
-        layer.free()
-    cache.detach_from_model(model)
 
-# --- DIAGNOSTIC HELPERS ---
-
-def print_header(title):
-    print(f"\n{'='*85}")
-    print(f"{title:^85}")
-    print(f"{'='*85}")
-
-def print_mem(label):
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / (1024**2)
-        reserved = torch.cuda.memory_reserved() / (1024**2)
-        print(f"[MEMORY] {label:<30} | Allocated: {allocated:7.2f} MB | Reserved: {reserved:7.2f} MB")
-
-def print_tensor_stats(name, t):
-    if t is None:
-        print(f"[TENSOR] {name}: None")
-        return
-    
-    t_f = t.float() if t.is_floating_point() else t.float()
-    nans = torch.isnan(t_f).sum().item()
-    infs = torch.isinf(t_f).sum().item()
-    rms = torch.sqrt(torch.mean(t_f**2)).item()
-    
-    print(f"[TENSOR] {name}")
-    print(f"         |- Shape : {list(t.shape)}")
-    print(f"         |- Dtype : {t.dtype} | Device: {t.device}")
-    print(f"         |- Min   : {t_f.min().item():10.5f}  | Max : {t_f.max().item():10.5f}")
-    print(f"         |- Mean  : {t_f.mean().item():10.5f}  | Std : {t_f.std().item():10.5f} | RMS : {rms:10.5f}")
-    
-    if nans > 0 or infs > 0:
-        print(f"         |- WARNING: {nans} NaNs, {infs} Infs detected!")
-
-# --- BULLETPROOF AUDIO LOADER ---
-
-def load_audio_ffmpeg_strict(path: str) -> np.ndarray:
-    """Uses FFMPEG to force 24kHz, Mono, Float32 PCM extraction."""
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", path,
-        "-ar", "24000", "-ac", "1", "-f", "f32le", "-"
-    ]
-    print(f"[FFMPEG] Executing: {' '.join(cmd)}")
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    
-    wav = np.frombuffer(proc.stdout, dtype=np.float32)
-    
-    # Strict -25 dBFS Normalization
+def load_audio_norm(path_or_bytes) -> np.ndarray:
+    if isinstance(path_or_bytes, bytes):
+        wav, sr = sf.read(io.BytesIO(path_or_bytes), dtype="float32")
+    else:
+        wav, sr = sf.read(path_or_bytes, dtype="float32")
+        
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    if sr != 24000:
+        wav = librosa.resample(wav, orig_sr=sr, target_sr=24000)
+        
     target_db_fs = -25.0
     eps = 1e-6
     rms = np.sqrt(np.mean(wav**2))
@@ -85,176 +43,202 @@ def load_audio_ffmpeg_strict(path: str) -> np.ndarray:
     maxabs = np.max(np.abs(wav))
     if maxabs > 1.0:
         wav /= (maxabs + eps)
-        
     return wav
 
-# --- MAIN DEBUGGER ---
 
-def run_debugger():
-    print_header("VIBEVOICE FORENSIC DIAGNOSTIC PIPELINE")
-    print_mem("Baseline")
-
-    print_header("1. ENGINE INITIALIZATION")
-    t0 = time.perf_counter()
-    engine = tts_engine._get_engine()
-    t1 = time.perf_counter()
-    print(f"[TIME] Engine loaded in {(t1-t0):.2f} seconds.")
-
-    text = "This is a diagnostic test of the VibeVoice system. We are tracking all internal metrics to ensure pristine audio generation."
-    
-    print_header("2. FFMPEG AUDIO EXTRACTION & ENCODING")
-    voice_path = os.path.join(os.getcwd(), "demo", "voices", "en-Alice_woman.wav")
-    print(f"[INFO] Reference voice: {voice_path}")
-    
-    if not os.path.exists(voice_path):
-        print(f"[ERROR] Could not find voice file at {voice_path}. Exiting.")
-        return
+class EngineState:
+    def __init__(self, llm_path: str, diff_path: str):
+        log.info(f"Loading native ExLlamaV3 VibeVoice model from {llm_path}...")
+        self.config = Config.from_directory(llm_path)
+        self.model = Model.from_config(self.config)
+        self.model.load(diffusion_model_path=diff_path)
+        self.tokenizer = Tokenizer.from_config(self.config)
         
-    wav_norm = load_audio_ffmpeg_strict(voice_path)
-    print(f"[INFO] Strict Audio length: {len(wav_norm)} samples ({(len(wav_norm)/24000):.2f} seconds)")
+        self.speech_start_id = self.tokenizer.single_id("<|vision_start|>")
+        self.speech_end_id = self.tokenizer.single_id("<|vision_end|>")
+
+
+def _get_engine() -> EngineState:
+    global _engine_instance
+    if _engine_instance is None:
+        _engine_instance = EngineState(CONFIG.llm_model_path, CONFIG.diffusion_model_path)
+    return _engine_instance
+
+
+def _create_cache(model, max_num_tokens):
+    cache = Cache(model, max_num_tokens=max_num_tokens)
+    for module in model.get_cache_layers():
+        cache.layers[module.layer_idx].alloc(module.device)
+    return cache
+
+
+def _destroy_cache(cache, model):
+    for module in model.get_cache_layers():
+        cache.layers[module.layer_idx].free()
+    cache.detach_from_model(model)
+
+
+def synthesize(
+    *,
+    root_dir: str, text: str, voice: Optional[str] = "Alice",
+    voice_path: Optional[str] = None, voice_data_b64: Optional[str] = None,
+    speakers: Optional[List[str]] = None, response_format: str = "wav",
+    speed: Optional[float] = None, seed: Optional[int] = None,
+    cfg_scale: Optional[float] = None, ddpm_steps: Optional[int] = None,
+    use_sampling: Optional[bool] = None, temperature: Optional[float] = None,
+    top_p: Optional[float] = None, negative_llm_steps_to_cache: Optional[int] = None,
+    increase_cfg: Optional[bool] = None, split_by_newline: Optional[bool] = None,
+) -> Tuple[bytes, str]:
     
+    engine = _get_engine()
+    
+    # 1. Resolve Voice Audio
+    audio_source = None
+    if voice_data_b64:
+        if voice_data_b64.startswith("data:"): voice_data_b64 = voice_data_b64.split(",", 1)[1]
+        audio_source = base64.b64decode(voice_data_b64)
+    elif voice_path:
+        audio_source = voice_path
+    elif voice:
+        mapper = VoiceMapper(root_dir)
+        audio_source = mapper.resolve(voice)
+        
+    if not audio_source: raise ValueError("Could not resolve reference voice.")
+        
+    # 2. Encode Real Human Voice
+    wav_norm = load_audio_norm(audio_source)
     with torch.inference_mode():
         device = engine.model.output_device or "cuda:0"
         audio_tensor = torch.from_numpy(wav_norm).float().unsqueeze(0).unsqueeze(0).to(device)
-        
-        # Encode on GPU, but move to CPU for ExLlamaV3's prefill stitching
         voice_embeddings = engine.model.worker.encode_acoustic(audio_tensor).cpu()
-        print_tensor_stats("Acoustic Embeddings (CPU)", voice_embeddings)
-    
+
     token_string = torch.full((1, voice_embeddings.shape[1]), -1, dtype=torch.long)
     voice_mme = MMEmbedding(embeddings=voice_embeddings.squeeze(0).half(), token_string=token_string, text_alias="<$VOICE$>")
-
-    print_header("3. EXACT TOKENIZATION DUMP")
+    
+    # 3. Format Prompt
     prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
     prompt += " Voice input:\n Speaker 0:<|vision_start|><$VOICE$><|vision_end|>\n"
-    prompt += f" Text input:\n Speaker 0: {text.strip()}\n" 
-    prompt += " Speech output:\n<|vision_start|>"
+    prompt += f" Text input:\n Speaker 0: {text.strip()}\n Speech output:\n<|vision_start|>"
     
-    input_ids = engine.tokenizer.encode(
-        prompt, 
-        add_bos=False, 
-        encode_special_tokens=True, 
-        embeddings=[voice_mme]
-    )
+    input_ids = engine.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True, embeddings=[voice_mme])
     
-    print(f"[INFO] Input prompt tokens length: {input_ids.shape[1]}")
+    cfg = cfg_scale if cfg_scale is not None else CONFIG.cfg_scale
+    use_cfg = cfg > 1.0
+    seed = seed if seed is not None and seed != -1 else int(time.time())
+    increase_cfg = increase_cfg if increase_cfg is not None else CONFIG.increase_cfg
     
-    print_header("4. LLM + DiT AUTOREGRESSIVE PIPELINED STREAM")
-    
-    cfg_scale = 1.3
-    use_cfg = True
-    seed = int(time.perf_counter())
-    increase_cfg = False
+    t_start = time.perf_counter()
+    tokens_gen = 0
     
     with torch.inference_mode():
-        
+        # 4. Static Negative CFG condition
         if use_cfg:
-            bos_id = engine.speech_start_id
-            neg_input_ids = torch.tensor([[bos_id]], dtype=torch.long, device="cpu")
-            neg_embeds = engine.model.modules[0].forward(neg_input_ids, {})
-            params_neg_prefill = {"attn_mode": "flash_attn_nc"}
-            _, neg_hidden = engine.model.forward(inputs_embeds=neg_embeds, params=params_neg_prefill)
+            neg_input_ids = torch.tensor([[engine.speech_start_id]], dtype=torch.long, device="cpu")
+            inputs_embeds_neg = engine.model.modules[0].forward(neg_input_ids, {})
+            _, neg_hidden = engine.model.forward(inputs_embeds=inputs_embeds_neg, params={"attn_mode": "flash_attn_nc"})
             cond_neg = neg_hidden[:, -1:, :].half()
         else:
             cond_neg = None
-
+            
         cache_pos = _create_cache(engine.model, max_num_tokens=8192)
-        inputs_embeds_pos = engine.model.modules[0].forward(input_ids, {"indexed_embeddings": [voice_mme]})
-        
-        print("\n[INFO] Running initial prefill...")
-        params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": 0, "batch_shape": (1, 8192)}
-        logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=inputs_embeds_pos, params=params_pos)
+
+        try:
+            # 5. LLM Prompt Prefill
+            inputs_embeds_pos = engine.model.modules[0].forward(input_ids, {"indexed_embeddings": [voice_mme]})
+            params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": 0, "batch_shape": (1, 8192)}
+            logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=inputs_embeds_pos, params=params_pos)
             
-        past_len = inputs_embeds_pos.shape[1]
-        all_latents = []
-        tokens_gen = 0
-        
-        chunk_size = 30
-        eos_flag = torch.zeros(1, dtype=torch.bool, device=device)
-        print(f"[INFO] Starting Pipelined AR loop (Chunk Size: {chunk_size}):\n")
-        
-        t_start = time.perf_counter()
-        
-        for chunk_start in range(0, 1500, chunk_size):
-            chunk_latents = []
-            chunk_preds = []
+            past_len = inputs_embeds_pos.shape[1]
+            all_latents = []
             
-            for t in range(chunk_start, min(chunk_start + chunk_size, 1500)):
-                cond_pos = hidden_last_pos[:, -1:, :].half()
-                c_neg = cond_neg if use_cfg else cond_pos
+            # 6. Pipelined AR Loop
+            chunk_size = 30
+            eos_flag = torch.zeros(1, dtype=torch.bool, device=device)
+            
+            for chunk_start in range(0, 1500, chunk_size):
+                chunk_latents = []
+                chunk_preds = []
                 
-                # C++ DiT
-                z = engine.model.worker.sample_latent(cond_pos, c_neg, cfg_scale, seed + t, increase_cfg)
-                chunk_latents.append(z)
-                
-                # C++ Connector
-                step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
-                
-                # C++ LLM Layers via Python
-                params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
-                logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
+                # CPU queues jobs instantly
+                for t in range(chunk_start, min(chunk_start + chunk_size, 1500)):
+                    cond_pos = hidden_last_pos[:, -1:, :].half()
                     
-                past_len += 1
-                tokens_gen += 1
+                    z = engine.model.worker.sample_latent(cond_pos, cond_neg if use_cfg else cond_pos, cfg, seed + t, increase_cfg)
+                    chunk_latents.append(z)
+                    
+                    step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
+                    
+                    params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
+                    logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
+                    past_len += 1
+                    tokens_gen += 1
+                    
+                    pred_id = logits_pos[0, -1, :].argmax()
+                    chunk_preds.append(pred_id)
+                    eos_flag.logical_or_(pred_id == engine.speech_end_id)
                 
-                pred_id = logits_pos[0, -1, :].argmax()
-                chunk_preds.append(pred_id)
-                eos_flag.logical_or_(pred_id == engine.speech_end_id)
+                all_latents.extend(chunk_latents)
                 
-            all_latents.extend(chunk_latents)
-            print(".", end="", flush=True)
-            
-            if eos_flag.item():
-                preds_cpu = torch.stack(chunk_preds).cpu()
-                eos_indices = (preds_cpu == engine.speech_end_id).nonzero(as_tuple=True)[0]
-                if len(eos_indices) > 0:
-                    first_eos_idx = eos_indices[0].item()
-                    trim_count = len(chunk_preds) - first_eos_idx - 1
-                    if trim_count > 0:
-                        all_latents = all_latents[:-trim_count]
-                        tokens_gen -= trim_count
-                print(f"\n[INFO] EOS reached accurately at frame {tokens_gen}")
-                break
-                
-        _destroy_cache(cache_pos, engine.model)
+                # The single PCIe sync point
+                if eos_flag.item():
+                    preds_cpu = torch.stack(chunk_preds).cpu()
+                    eos_indices = (preds_cpu == engine.speech_end_id).nonzero(as_tuple=True)[0]
+                    if len(eos_indices) > 0:
+                        first_eos_idx = eos_indices[0].item()
+                        trim_count = len(chunk_preds) - first_eos_idx - 1
+                        if trim_count > 0:
+                            all_latents = all_latents[:-trim_count]
+                            tokens_gen -= trim_count
+                    break
+        finally:
+            _destroy_cache(cache_pos, engine.model)
 
-    t_end = time.perf_counter()
-    tps = tokens_gen / (t_end - t_start + 1e-6)
-    print(f"\n[TIME] Total AR Generation Time:   {t_end-t_start:.2f} s")
-    print(f"[METRIC] Frames Generated:         {tokens_gen}")
-    print(f"[METRIC] Frames Per Second (FPS):  {tps:.2f} f/s")
+        if not all_latents: return b"", "audio/wav"
 
-    print_header("5. FULL-SEQUENCE C++ VAE DECODER EXECUTION")
-    latents = torch.cat(all_latents, dim=1)
-    print_tensor_stats("latents", latents)
-    
-    audio_tensor = engine.model.worker.decode_vae(latents)
-    print_tensor_stats("audio_tensor (PCM Float32)", audio_tensor)
+        # 7. VAE Decode (100% C++)
+        latents = torch.cat(all_latents, dim=1)
+        audio_tensor = engine.model.worker.decode_vae(latents)
 
-    print_header("6. AUDIO CLEANUP & SAVE")
+    # 8. Post-process Audio
     wav = audio_tensor.cpu().numpy()
-    
     warmup = 2400
     if len(wav) > warmup:
         mask = np.abs(wav[warmup:]) > 0.005
         trim_start = max(warmup, warmup + np.argmax(mask) - 800) if np.any(mask) else warmup
+        
         mask_tail = np.abs(wav) > 0.01
         trim_end = min(len(wav), len(wav) - 1 - np.argmax(mask_tail[::-1]) + 1200 + 1) if np.any(mask_tail) else len(wav)
+        
         wav = wav[trim_start:trim_end] if trim_start < trim_end else wav[warmup:]
+        
         n_in = min(480, len(wav))
         if n_in > 0: wav[:n_in] *= (np.linspace(0, 1, n_in, dtype=np.float32) ** 2)
+            
         n_out = min(1200, len(wav))
         if n_out > 0: wav[-n_out:] *= np.linspace(1, 0, n_out, dtype=np.float32)
 
+    if speed is not None:
+        wav = apply_speed(wav, float(speed))
+
     max_val = np.max(np.abs(wav))
-    if max_val > 0.95: wav = wav / (max_val / 0.95)
+    if max_val > 0.95:
+        wav = wav / (max_val / 0.95)
 
-    out_file = "debugger_output_cpp.wav"
-    sf.write(out_file, wav, 24000)
+    # Calculate and Log Metrics!
+    t_end = time.perf_counter()
+    gen_time = t_end - t_start
+    audio_duration = len(wav) / CONFIG.sample_rate
+    rtf = audio_duration / gen_time if gen_time > 0 else 0
+    fps = tokens_gen / gen_time if gen_time > 0 else 0
     
-    print(f"[SUCCESS] Audio saved to {out_file}")
-    print(f"[METRIC] Final Audio Duration: {(len(wav)/24000):.2f} seconds")
-    print_header("DIAGNOSTICS COMPLETE")
+    log.info(f"Synthesized {audio_duration:.2f}s audio in {gen_time:.2f}s. RTF: {rtf:.2f}x | {fps:.1f} frames/s")
 
-if __name__ == "__main__":
-    run_debugger()
+    data, content_type = to_bytes_for_format(wav, CONFIG.sample_rate, response_format)
+    return data, content_type
+
+
+async def synthesize_stream_pcm(*args, **kwargs) -> AsyncIterator[np.ndarray]:
+    data, _ = synthesize(**kwargs)
+    import soundfile as sf
+    wav, _ = sf.read(io.BytesIO(data), dtype="float32")
+    yield wav
