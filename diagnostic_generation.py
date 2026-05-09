@@ -250,8 +250,8 @@ def run_debugger(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--llm_model_path", type=str, default=None, help="Override LLM path")
-    parser.add_argument("--diffusion_model_path", type=str, default=None, help="Override DiT path")
+    parser.add_argument("--llm-model-path", type=str, default=None, help="Override LLM path")
+    parser.add_argument("--diffusion-model-path", type=str, default=None, help="Override DiT path")
     args = parser.parse_args()
 
     try:
