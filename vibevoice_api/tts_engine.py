@@ -106,7 +106,7 @@ def synthesize(
         
     if not audio_source: raise ValueError("Could not resolve reference voice.")
         
-    # 2. Encode Real Human Voice (100% C++)
+    # 2. Encode Real Human Voice (Moved to CPU for ExLlamaV3 text-stitching)
     wav_norm = load_audio_norm(audio_source)
     with torch.inference_mode():
         device = engine.model.output_device or "cuda:0"
@@ -148,26 +148,50 @@ def synthesize(
             
             past_len = inputs_embeds_pos.shape[1]
             all_latents = []
-            log.info("Starting autoregressive diffusion loop...")
+            log.info("Starting autoregressive diffusion loop (Pipelined)...")
             
-            # 6. AR Loop (Python Orchestrator, C++ Kernels)
-            for t in range(1500):
-                cond_pos = hidden_last_pos[:, -1:, :].half()
+            # 6. Pipelined AR Loop (Solves CPU Chit-Chat)
+            chunk_size = 30  # Number of frames the CPU will queue onto the GPU at once
+            eos_flag = torch.zeros(1, dtype=torch.bool, device=device)
+            
+            for chunk_start in range(0, 1500, chunk_size):
+                chunk_latents = []
+                chunk_preds = []
                 
-                # DiT (C++)
-                z = engine.model.worker.sample_latent(cond_pos, cond_neg if use_cfg else cond_pos, cfg, seed + t, increase_cfg)
-                all_latents.append(z)
+                # The Celeron queues this entire loop into CUDA instantly without waiting.
+                for t in range(chunk_start, min(chunk_start + chunk_size, 1500)):
+                    cond_pos = hidden_last_pos[:, -1:, :].half()
+                    
+                    # DiT (C++)
+                    z = engine.model.worker.sample_latent(cond_pos, cond_neg if use_cfg else cond_pos, cfg, seed + t, increase_cfg)
+                    chunk_latents.append(z)
+                    
+                    # Acoustic Connector (C++)
+                    step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
+                    
+                    # LLM Step (C++ Kernels via Python dispatch)
+                    params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
+                    logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
+                    past_len += 1
+                    
+                    # Async EOS Check (NO .item() inside the inner loop!)
+                    pred_id = logits_pos[0, -1, :].argmax()
+                    chunk_preds.append(pred_id)
+                    eos_flag.logical_or_(pred_id == engine.speech_end_id)
                 
-                # Acoustic Connector (C++)
-                step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
+                all_latents.extend(chunk_latents)
                 
-                # LLM Step (C++ Kernels)
-                params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
-                logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
-                past_len += 1
-                
-                # PCIe Sync for EOS Check
-                if logits_pos[0, -1, :].argmax().item() == engine.speech_end_id:
+                # Single PCIe Sync Point per chunk. 
+                # This drops CPU<->GPU communication overhead by ~97%
+                if eos_flag.item():
+                    # Find exact EOS frame to trim any over-generated garbage latents
+                    preds_cpu = torch.stack(chunk_preds).cpu()
+                    eos_indices = (preds_cpu == engine.speech_end_id).nonzero(as_tuple=True)[0]
+                    if len(eos_indices) > 0:
+                        first_eos_idx = eos_indices[0].item()
+                        trim_count = len(chunk_preds) - first_eos_idx - 1
+                        if trim_count > 0:
+                            all_latents = all_latents[:-trim_count]
                     break
         finally:
             _destroy_cache(cache_pos, engine.model)

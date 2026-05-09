@@ -1,9 +1,11 @@
+# --- START OF FILE diagnostic_generation.py ---
 import os
 import sys
 import time
 import torch
 import numpy as np
 import subprocess
+import soundfile as sf
 
 # Ensure we are in the root directory
 sys.path.insert(0, os.getcwd())
@@ -115,13 +117,9 @@ def run_debugger():
         device = engine.model.output_device or "cuda:0"
         audio_tensor = torch.from_numpy(wav_norm).float().unsqueeze(0).unsqueeze(0).to(device)
         
-        # Use C++ worker directly!
-        ac_emb = engine.model.worker.encode_acoustic(audio_tensor)
-        print_tensor_stats("Acoustic Embeddings (C++ Connector)", ac_emb)
-        
-        voice_embeddings = ac_emb.cpu()
-    
-    print_tensor_stats("Final Combined Voice Embeddings", voice_embeddings)
+        # Encode on GPU, but move to CPU for ExLlamaV3's prefill stitching
+        voice_embeddings = engine.model.worker.encode_acoustic(audio_tensor).cpu()
+        print_tensor_stats("Acoustic Embeddings (CPU)", voice_embeddings)
     
     token_string = torch.full((1, voice_embeddings.shape[1]), -1, dtype=torch.long)
     voice_mme = MMEmbedding(embeddings=voice_embeddings.squeeze(0).half(), token_string=token_string, text_alias="<$VOICE$>")
@@ -140,19 +138,8 @@ def run_debugger():
     )
     
     print(f"[INFO] Input prompt tokens length: {input_ids.shape[1]}")
-    print("[INFO] BPE Token Breakdown (Look closely at spaces near 'Speaker 0:' and '<|vision_start|>'):")
     
-    id_list = input_ids[0].tolist()
-    for i, tid in enumerate(id_list):
-        if tid == -1 or tid >= 1000000000:
-            print(f"  [{i:3d}] ID: {tid:<9d} | String: <$VOICE_EMBEDDING_FRAME$>")
-        else:
-            string_val = engine.tokenizer.tokenizer.decode([tid])
-            if string_val == "":
-                string_val = engine.tokenizer.get_id_to_piece_list(True)[tid]
-            print(f"  [{i:3d}] ID: {tid:<9d} | String: {repr(string_val)}")
-
-    print_header("4. LLM + DiT AUTOREGRESSIVE STREAM")
+    print_header("4. LLM + DiT AUTOREGRESSIVE PIPELINED STREAM")
     
     cfg_scale = 1.3
     use_cfg = True
@@ -161,7 +148,6 @@ def run_debugger():
     
     with torch.inference_mode():
         
-        # Prepare Static Negative Condition
         if use_cfg:
             bos_id = engine.speech_start_id
             neg_input_ids = torch.tensor([[bos_id]], dtype=torch.long, device="cpu")
@@ -169,13 +155,10 @@ def run_debugger():
             params_neg_prefill = {"attn_mode": "flash_attn_nc"}
             _, neg_hidden = engine.model.forward(inputs_embeds=neg_embeds, params=params_neg_prefill)
             cond_neg = neg_hidden[:, -1:, :].half()
-            
-            print_tensor_stats("Negative CFG Condition (Static)", cond_neg)
         else:
             cond_neg = None
 
         cache_pos = _create_cache(engine.model, max_num_tokens=8192)
-
         inputs_embeds_pos = engine.model.modules[0].forward(input_ids, {"indexed_embeddings": [voice_mme]})
         
         print("\n[INFO] Running initial prefill...")
@@ -184,51 +167,53 @@ def run_debugger():
             
         past_len = inputs_embeds_pos.shape[1]
         all_latents = []
-        
-        max_speech_frames = 1500
         tokens_gen = 0
         
-        print("[INFO] Starting AR loop (Tracking first 5 frames closely):\n")
+        chunk_size = 30
+        eos_flag = torch.zeros(1, dtype=torch.bool, device=device)
+        print(f"[INFO] Starting Pipelined AR loop (Chunk Size: {chunk_size}):\n")
         
         t_start = time.perf_counter()
         
-        for t in range(max_speech_frames):
-            cond_pos = hidden_last_pos[:, -1:, :].half()
-            c_neg = cond_neg if use_cfg else cond_pos
+        for chunk_start in range(0, 1500, chunk_size):
+            chunk_latents = []
+            chunk_preds = []
             
-            if t < 5:
-                cos_sim = torch.nn.functional.cosine_similarity(cond_pos.float(), c_neg.float(), dim=-1).item()
-                print(f"  [Frame {t}] CFG Condition Cosine Similarity (Pos vs Neg): {cos_sim:.5f} (1.0 = identical)")
+            for t in range(chunk_start, min(chunk_start + chunk_size, 1500)):
+                cond_pos = hidden_last_pos[:, -1:, :].half()
+                c_neg = cond_neg if use_cfg else cond_pos
                 
-                # Check LLM distribution
-                probs = torch.nn.functional.softmax(logits_pos[0, -1, :].float(), dim=-1)
-                top_probs, top_ids = torch.topk(probs, 3)
-                print(f"  [Frame {t}] LLM Top-3 Tokens:")
-                for i in range(3):
-                    tid = top_ids[i].item()
-                    prob = top_probs[i].item()
-                    token_str = engine.tokenizer.get_id_to_piece_list(True)[tid] if tid < 200000 else f"<SPECIAL_{tid}>"
-                    print(f"      {i+1}: {token_str!r} ({prob:.2%})")
-            
-            # C++ DiT
-            z = engine.model.worker.sample_latent(cond_pos, c_neg, cfg_scale, seed + t, increase_cfg)
-            all_latents.append(z)
-            
-            # C++ Connector
-            step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
-            
-            params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
-            logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
+                # C++ DiT
+                z = engine.model.worker.sample_latent(cond_pos, c_neg, cfg_scale, seed + t, increase_cfg)
+                chunk_latents.append(z)
                 
-            past_len += 1
-            tokens_gen += 1
+                # C++ Connector
+                step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
+                
+                # C++ LLM Layers via Python
+                params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
+                logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
+                    
+                past_len += 1
+                tokens_gen += 1
+                
+                pred_id = logits_pos[0, -1, :].argmax()
+                chunk_preds.append(pred_id)
+                eos_flag.logical_or_(pred_id == engine.speech_end_id)
+                
+            all_latents.extend(chunk_latents)
+            print(".", end="", flush=True)
             
-            if tokens_gen > 5 and tokens_gen % 10 == 0:
-                print(".", end="", flush=True)
-            
-            pred_id = logits_pos[0, -1, :].argmax().item()
-            if pred_id == engine.speech_end_id:
-                print(f"\n[INFO] EOS reached at frame {tokens_gen}")
+            if eos_flag.item():
+                preds_cpu = torch.stack(chunk_preds).cpu()
+                eos_indices = (preds_cpu == engine.speech_end_id).nonzero(as_tuple=True)[0]
+                if len(eos_indices) > 0:
+                    first_eos_idx = eos_indices[0].item()
+                    trim_count = len(chunk_preds) - first_eos_idx - 1
+                    if trim_count > 0:
+                        all_latents = all_latents[:-trim_count]
+                        tokens_gen -= trim_count
+                print(f"\n[INFO] EOS reached accurately at frame {tokens_gen}")
                 break
                 
         _destroy_cache(cache_pos, engine.model)
@@ -249,45 +234,22 @@ def run_debugger():
     print_header("6. AUDIO CLEANUP & SAVE")
     wav = audio_tensor.cpu().numpy()
     
-    # --- Microsoft Reference Audio Cleanup ---
     warmup = 2400
     if len(wav) > warmup:
         mask = np.abs(wav[warmup:]) > 0.005
-        if np.any(mask):
-            speech_start = np.argmax(mask)
-            trim_start = max(warmup, warmup + speech_start - 800)
-        else:
-            trim_start = warmup
-            
+        trim_start = max(warmup, warmup + np.argmax(mask) - 800) if np.any(mask) else warmup
         mask_tail = np.abs(wav) > 0.01
-        if np.any(mask_tail):
-            speech_end = len(wav) - 1 - np.argmax(mask_tail[::-1])
-            trim_end = min(len(wav), speech_end + 1200 + 1)
-        else:
-            trim_end = len(wav)
-            
-        if trim_start < trim_end:
-            wav = wav[trim_start:trim_end]
-        else:
-            wav = wav[warmup:]
-            
+        trim_end = min(len(wav), len(wav) - 1 - np.argmax(mask_tail[::-1]) + 1200 + 1) if np.any(mask_tail) else len(wav)
+        wav = wav[trim_start:trim_end] if trim_start < trim_end else wav[warmup:]
         n_in = min(480, len(wav))
-        if n_in > 0:
-            t = np.linspace(0, 1, n_in, dtype=np.float32)
-            wav[:n_in] *= (t * t)
-            
+        if n_in > 0: wav[:n_in] *= (np.linspace(0, 1, n_in, dtype=np.float32) ** 2)
         n_out = min(1200, len(wav))
-        if n_out > 0:
-            t = np.linspace(1, 0, n_out, dtype=np.float32)
-            wav[-n_out:] *= t
+        if n_out > 0: wav[-n_out:] *= np.linspace(1, 0, n_out, dtype=np.float32)
 
-    # --- Peak Normalization ---
     max_val = np.max(np.abs(wav))
-    if max_val > 0.95:
-        wav = wav / (max_val / 0.95)
+    if max_val > 0.95: wav = wav / (max_val / 0.95)
 
     out_file = "debugger_output_cpp.wav"
-    import soundfile as sf
     sf.write(out_file, wav, 24000)
     
     print(f"[SUCCESS] Audio saved to {out_file}")
