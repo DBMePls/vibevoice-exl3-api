@@ -119,31 +119,52 @@ def synthesize(
     
     input_ids = engine.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True, embeddings=[voice_mme])
     
+    # Resolve generation configurations
     cfg = cfg_scale if cfg_scale is not None else CONFIG.cfg_scale
     use_cfg = cfg > 1.0
     seed = seed if seed is not None and seed != -1 else int(time.time())
     increase_cfg = increase_cfg if increase_cfg is not None else CONFIG.increase_cfg
+    neg_cache_steps = negative_llm_steps_to_cache if negative_llm_steps_to_cache is not None else CONFIG.negative_llm_steps_to_cache
     
     t_start = time.perf_counter()
     tokens_gen = 0
+    cache_neg = None
     
     with torch.inference_mode():
-        if use_cfg:
-            neg_input_ids = torch.tensor([[engine.speech_start_id]], dtype=torch.long, device="cpu")
-            inputs_embeds_neg = engine.model.modules[0].forward(neg_input_ids, {})
-            _, neg_hidden = engine.model.forward(inputs_embeds=inputs_embeds_neg, params={"attn_mode": "flash_attn_nc"})
-            cond_neg = neg_hidden[:, -1:, :].half()
-        else:
-            cond_neg = None
-            
         cache_pos = _create_cache(engine.model, max_num_tokens=8192)
 
+        # Setup Negative State
+        if use_cfg:
+            if neg_cache_steps >= 0:
+                # Dynamic Negative Cache Setup (Every Step or Every N Steps)
+                cache_neg = _create_cache(engine.model, max_num_tokens=8192)
+                neg_input_ids = torch.tensor([[engine.speech_start_id]], dtype=torch.long, device="cpu")
+                inputs_embeds_neg = engine.model.modules[0].forward(neg_input_ids, {})
+                
+                params_neg = {"attn_mode": "flash_attn", "cache": cache_neg, "past_len": 0, "batch_shape": (1, 8192)}
+                _, hidden_last_neg = engine.model.forward(inputs_embeds=inputs_embeds_neg, params=params_neg)
+                
+                cond_neg = hidden_last_neg[:, -1:, :].half()
+                past_len_neg = inputs_embeds_neg.shape[1]
+                
+                accumulated_neg_embeds = []
+                steps_since_neg_update = 0
+            else:
+                # Static Negative State Setup (Fastest, evaluated once)
+                neg_input_ids = torch.tensor([[engine.speech_start_id]], dtype=torch.long, device="cpu")
+                inputs_embeds_neg = engine.model.modules[0].forward(neg_input_ids, {})
+                _, neg_hidden = engine.model.forward(inputs_embeds=inputs_embeds_neg, params={"attn_mode": "flash_attn_nc"})
+                cond_neg = neg_hidden[:, -1:, :].half()
+        else:
+            cond_neg = None
+
         try:
+            # Initial Positive Prefill
             inputs_embeds_pos = engine.model.modules[0].forward(input_ids, {"indexed_embeddings": [voice_mme]})
             params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": 0, "batch_shape": (1, 8192)}
             logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=inputs_embeds_pos, params=params_pos)
             
-            past_len = inputs_embeds_pos.shape[1]
+            past_len_pos = inputs_embeds_pos.shape[1]
             all_latents = []
             
             # --- ASYNCHRONOUS PIPELINED AR LOOP ---
@@ -156,17 +177,42 @@ def synthesize(
                 
                 for t in range(chunk_start, min(chunk_start + chunk_size, 1500)):
                     cond_pos = hidden_last_pos[:, -1:, :].half()
+                    c_neg = cond_neg if use_cfg else cond_pos
                     
-                    z = engine.model.worker.sample_latent(cond_pos, cond_neg if use_cfg else cond_pos, cfg, seed + t, increase_cfg)
+                    # 1. Diffusion C++ Step
+                    z = engine.model.worker.sample_latent(cond_pos, c_neg, cfg, seed + t, increase_cfg)
                     chunk_latents.append(z)
                     
+                    # 2. Convert Latent to LLM Embedding
                     step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
+                    step_embed_dtype = step_embed.to(inputs_embeds_pos.dtype)
                     
-                    params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
-                    logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
-                    past_len += 1
+                    # 3. Positive LLM Step
+                    params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len_pos, "batch_shape": (1, 8192)}
+                    logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed_dtype, params=params_pos)
+                    past_len_pos += 1
                     tokens_gen += 1
+
+                    # 4. Negative LLM Step (Lazy Mini-Prefill)
+                    if use_cfg and neg_cache_steps >= 0:
+                        accumulated_neg_embeds.append(step_embed_dtype)
+                        steps_since_neg_update += 1
+                        
+                        # Once we exceed the wait threshold, fire a batched update
+                        if steps_since_neg_update > neg_cache_steps:
+                            # Concat on GPU (Zero CPU overhead)
+                            neg_embed_batch = torch.cat(accumulated_neg_embeds, dim=1)
+                            
+                            params_neg = {"attn_mode": "flash_attn", "cache": cache_neg, "past_len": past_len_neg, "batch_shape": (1, 8192)}
+                            _, hidden_last_neg = engine.model.forward(inputs_embeds=neg_embed_batch, params=params_neg)
+                            
+                            cond_neg = hidden_last_neg[:, -1:, :].half()
+                            past_len_neg += neg_embed_batch.shape[1]
+                            
+                            accumulated_neg_embeds.clear()
+                            steps_since_neg_update = 0
                     
+                    # Check EOS
                     pred_id = logits_pos[0, -1, :].argmax()
                     chunk_preds.append(pred_id)
                     eos_flag.logical_or_(pred_id == engine.speech_end_id)
@@ -186,6 +232,8 @@ def synthesize(
                     break
         finally:
             _destroy_cache(cache_pos, engine.model)
+            if cache_neg is not None:
+                _destroy_cache(cache_neg, engine.model)
 
         if not all_latents: return b"", "audio/wav"
 
@@ -227,3 +275,4 @@ async def synthesize_stream_pcm(*args, **kwargs) -> AsyncIterator[np.ndarray]:
     import soundfile as sf
     wav, _ = sf.read(io.BytesIO(data), dtype="float32")
     yield wav
+# --- END OF FILE vibevoice_api/tts_engine.py ---
