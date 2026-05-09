@@ -1,137 +1,124 @@
-# --- START OF FILE vibevoice_api/tts_engine.py ---
-from __future__ import annotations
+# --- START OF FILE diagnostic_generation.py ---
 import os
+import sys
+import time
 import torch
 import numpy as np
-import logging
-import io
-import time
-import base64
-from typing import Optional, Tuple, List, AsyncIterator
+import subprocess
+import argparse
+import re
 
-import soundfile as sf
-import librosa
+# 1. Load .env BEFORE anything else so default paths match the server
+def _load_dotenv():
+    env_path = os.path.join(os.getcwd(), ".env")
+    if not os.path.exists(env_path): return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"): continue
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", s)
+            if not m: continue
+            k, v = m.group(1), m.group(2)
+            if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                v = v[1:-1]
+            os.environ.setdefault(k, v)
 
+_load_dotenv()
+
+# Ensure we are in the root directory
+sys.path.insert(0, os.getcwd())
+
+from vibevoice_api import tts_engine
 from vibevoice_api.config import CONFIG
-from vibevoice_api.audio_utils import apply_speed, to_bytes_for_format
-from vibevoice_api.voice_map import VoiceMapper
-from exllamav3 import Config, Model, Cache, Tokenizer
+from exllamav3 import Cache
 from exllamav3.tokenizer import MMEmbedding
 
-log = logging.getLogger("vibevoice_api.tts_engine")
-_engine_instance = None
-
-
-def load_audio_norm(path_or_bytes) -> np.ndarray:
-    if isinstance(path_or_bytes, bytes):
-        wav, sr = sf.read(io.BytesIO(path_or_bytes), dtype="float32")
-    else:
-        wav, sr = sf.read(path_or_bytes, dtype="float32")
-        
-    if wav.ndim > 1:
-        wav = wav.mean(axis=1)
-    if sr != 24000:
-        wav = librosa.resample(wav, orig_sr=sr, target_sr=24000)
-        
-    target_db_fs = -25.0
-    eps = 1e-6
-    rms = np.sqrt(np.mean(wav**2))
-    target_lin = 10 ** (target_db_fs / 20.0)
-    scalar = target_lin / (rms + eps)
-    wav = wav * scalar
-    
-    maxabs = np.max(np.abs(wav))
-    if maxabs > 1.0:
-        wav /= (maxabs + eps)
-    return wav
-
-
-class EngineState:
-    def __init__(self, llm_path: str, diff_path: str):
-        log.info(f"Loading native ExLlamaV3 VibeVoice model from {llm_path}...")
-        self.config = Config.from_directory(llm_path)
-        self.model = Model.from_config(self.config)
-        self.model.load(diffusion_model_path=diff_path)
-        self.tokenizer = Tokenizer.from_config(self.config)
-        
-        self.speech_start_id = self.tokenizer.single_id("<|vision_start|>")
-        self.speech_end_id = self.tokenizer.single_id("<|vision_end|>")
-
-
-def _get_engine() -> EngineState:
-    global _engine_instance
-    if _engine_instance is None:
-        _engine_instance = EngineState(CONFIG.llm_model_path, CONFIG.diffusion_model_path)
-    return _engine_instance
-
-
+# --- CACHE HELPERS ---
 def _create_cache(model, max_num_tokens):
     cache = Cache(model, max_num_tokens=max_num_tokens)
     for module in model.get_cache_layers():
-        cache.layers[module.layer_idx].alloc(module.device)
+        layer = cache.layers[module.layer_idx]
+        layer.alloc(module.device)
     return cache
-
 
 def _destroy_cache(cache, model):
     for module in model.get_cache_layers():
-        cache.layers[module.layer_idx].free()
+        layer = cache.layers[module.layer_idx]
+        layer.free()
     cache.detach_from_model(model)
 
+# --- DIAGNOSTIC HELPERS ---
+def print_header(title):
+    print(f"\n{'='*85}")
+    print(f"{title:^85}")
+    print(f"{'='*85}")
 
-def synthesize(
-    *,
-    root_dir: str, text: str, voice: Optional[str] = "Alice",
-    voice_path: Optional[str] = None, voice_data_b64: Optional[str] = None,
-    speakers: Optional[List[str]] = None, response_format: str = "wav",
-    speed: Optional[float] = None, seed: Optional[int] = None,
-    cfg_scale: Optional[float] = None, ddpm_steps: Optional[int] = None,
-    use_sampling: Optional[bool] = None, temperature: Optional[float] = None,
-    top_p: Optional[float] = None, negative_llm_steps_to_cache: Optional[int] = None,
-    increase_cfg: Optional[bool] = None, split_by_newline: Optional[bool] = None,
-) -> Tuple[bytes, str]:
+def load_audio_ffmpeg_strict(path: str) -> np.ndarray:
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-ar", "24000", "-ac", "1", "-f", "f32le", "-"]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    wav = np.frombuffer(proc.stdout, dtype=np.float32)
     
-    engine = _get_engine()
+    # Strict -25 dBFS Normalization
+    target_lin = 10 ** (-25.0 / 20.0)
+    wav = wav * (target_lin / (np.sqrt(np.mean(wav**2)) + 1e-6))
+    maxabs = np.max(np.abs(wav))
+    if maxabs > 1.0: wav /= (maxabs + 1e-6)
+    return wav
+
+# --- MAIN DEEP PROFILER ---
+def run_debugger(args):
+    print_header("VIBEVOICE HARDWARE BOTTLENECK PROFILER")
+
+    # Override config with args if provided
+    if args.diffusion_model_path:
+        CONFIG.diffusion_model_path = args.diffusion_model_path
+    if args.llm_model_path:
+        CONFIG.llm_model_path = args.llm_model_path
+
+    print(f"[INFO] Target LLM: {CONFIG.llm_model_path}")
+    print(f"[INFO] Target DiT: {CONFIG.diffusion_model_path}")
+    print("[INFO] Loading engine... (This takes a few seconds)")
     
-    # 1. Resolve Voice Audio
-    audio_source = None
-    if voice_data_b64:
-        if voice_data_b64.startswith("data:"): voice_data_b64 = voice_data_b64.split(",", 1)[1]
-        audio_source = base64.b64decode(voice_data_b64)
-    elif voice_path:
-        audio_source = voice_path
-    elif voice:
-        mapper = VoiceMapper(root_dir)
-        audio_source = mapper.resolve(voice)
-        
-    if not audio_source: raise ValueError("Could not resolve reference voice.")
-        
-    # 2. Encode Real Human Voice
-    wav_norm = load_audio_norm(audio_source)
+    t0 = time.perf_counter()
+    engine = tts_engine._get_engine()
+    device = engine.model.output_device or "cuda:0"
+    print(f"[TIME] Engine loaded successfully in {(time.perf_counter()-t0):.2f} seconds.")
+
+    text = "This is a hardware profiler test. We are tracking exact CPU and GPU timing to eliminate all bottlenecks."
+    
+    voice_path = os.path.join(os.getcwd(), "demo", "voices", "en-Alice_woman.wav")
+    if not os.path.exists(voice_path):
+        print(f"[ERROR] Could not find voice file at {voice_path}. Make sure you are in the root directory.")
+        return
+
+    wav_norm = load_audio_ffmpeg_strict(voice_path)
+    
     with torch.inference_mode():
-        device = engine.model.output_device or "cuda:0"
         audio_tensor = torch.from_numpy(wav_norm).float().unsqueeze(0).unsqueeze(0).to(device)
         voice_embeddings = engine.model.worker.encode_acoustic(audio_tensor).cpu()
-
+    
     token_string = torch.full((1, voice_embeddings.shape[1]), -1, dtype=torch.long)
     voice_mme = MMEmbedding(embeddings=voice_embeddings.squeeze(0).half(), token_string=token_string, text_alias="<$VOICE$>")
-    
-    # 3. Format Prompt
+
     prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
     prompt += " Voice input:\n Speaker 0:<|vision_start|><$VOICE$><|vision_end|>\n"
     prompt += f" Text input:\n Speaker 0: {text.strip()}\n Speech output:\n<|vision_start|>"
     
     input_ids = engine.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True, embeddings=[voice_mme])
     
-    cfg = cfg_scale if cfg_scale is not None else CONFIG.cfg_scale
-    use_cfg = cfg > 1.0
-    seed = seed if seed is not None and seed != -1 else int(time.time())
-    increase_cfg = increase_cfg if increase_cfg is not None else CONFIG.increase_cfg
+    print_header("STARTING HARDWARE PROFILER")
     
-    t_start = time.perf_counter()
-    tokens_gen = 0
+    cfg = 1.3
+    use_cfg = True
+    seed = int(time.perf_counter())
+    
+    # PROFILING VARIABLES
+    total_cpu_queue_time = 0.0
+    total_pcie_sync_time = 0.0
+    cuda_events_start = []
+    cuda_events_end = []
     
     with torch.inference_mode():
-        # 4. Static Negative CFG condition
         if use_cfg:
             neg_input_ids = torch.tensor([[engine.speech_start_id]], dtype=torch.long, device="cpu")
             inputs_embeds_neg = engine.model.modules[0].forward(neg_input_ids, {})
@@ -143,33 +130,46 @@ def synthesize(
         cache_pos = _create_cache(engine.model, max_num_tokens=8192)
 
         try:
-            # 5. LLM Prompt Prefill
+            # Prefill
             inputs_embeds_pos = engine.model.modules[0].forward(input_ids, {"indexed_embeddings": [voice_mme]})
             params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": 0, "batch_shape": (1, 8192)}
             logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=inputs_embeds_pos, params=params_pos)
             
             past_len = inputs_embeds_pos.shape[1]
             all_latents = []
-            
-            # 6. Pipelined AR Loop
             chunk_size = 30
             eos_flag = torch.zeros(1, dtype=torch.bool, device=device)
+            tokens_gen = 0
+            
+            print(f"[INFO] AR Pipelined Loop running with chunk size: {chunk_size}")
+            
+            sys.stdout.write("Generating: [")
+            sys.stdout.flush()
+            
+            wall_start = time.perf_counter()
             
             for chunk_start in range(0, 1500, chunk_size):
                 chunk_latents = []
                 chunk_preds = []
                 
-                # CPU queues jobs instantly
+                # --- START CPU QUEUE TIMER ---
+                t_cpu_start = time.perf_counter()
+                
+                # --- START CUDA HARDWARE TIMER ---
+                ev_start = torch.cuda.Event(enable_timing=True)
+                ev_end = torch.cuda.Event(enable_timing=True)
+                ev_start.record()
+                
                 for t in range(chunk_start, min(chunk_start + chunk_size, 1500)):
                     cond_pos = hidden_last_pos[:, -1:, :].half()
                     
-                    z = engine.model.worker.sample_latent(cond_pos, cond_neg if use_cfg else cond_pos, cfg, seed + t, increase_cfg)
+                    z = engine.model.worker.sample_latent(cond_pos, cond_neg if use_cfg else cond_pos, cfg, seed + t, False)
                     chunk_latents.append(z)
-                    
                     step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
                     
                     params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
                     logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
+                    
                     past_len += 1
                     tokens_gen += 1
                     
@@ -177,10 +177,28 @@ def synthesize(
                     chunk_preds.append(pred_id)
                     eos_flag.logical_or_(pred_id == engine.speech_end_id)
                 
+                # --- STOP CUDA HARDWARE TIMER ---
+                ev_end.record()
+                cuda_events_start.append(ev_start)
+                cuda_events_end.append(ev_end)
+                
+                # --- STOP CPU QUEUE TIMER ---
+                t_cpu_end = time.perf_counter()
+                total_cpu_queue_time += (t_cpu_end - t_cpu_start)
+                
+                # Asynchronous Progress Bar (No sync overhead!)
+                sys.stdout.write("#")
+                sys.stdout.flush()
+                
+                # --- START SYNC TIMER ---
+                t_sync_start = time.perf_counter()
+                is_eos = eos_flag.item() # <--- THE ONLY SYNC
+                total_pcie_sync_time += (time.perf_counter() - t_sync_start)
+                # --- STOP SYNC TIMER ---
+                
                 all_latents.extend(chunk_latents)
                 
-                # The single PCIe sync point
-                if eos_flag.item():
+                if is_eos:
                     preds_cpu = torch.stack(chunk_preds).cpu()
                     eos_indices = (preds_cpu == engine.speech_end_id).nonzero(as_tuple=True)[0]
                     if len(eos_indices) > 0:
@@ -190,55 +208,55 @@ def synthesize(
                             all_latents = all_latents[:-trim_count]
                             tokens_gen -= trim_count
                     break
+                    
+            wall_end = time.perf_counter()
+            sys.stdout.write("] Done!\n")
+            
         finally:
             _destroy_cache(cache_pos, engine.model)
 
-        if not all_latents: return b"", "audio/wav"
-
-        # 7. VAE Decode (100% C++)
         latents = torch.cat(all_latents, dim=1)
         audio_tensor = engine.model.worker.decode_vae(latents)
+        wav = audio_tensor.cpu().numpy()
 
-    # 8. Post-process Audio
-    wav = audio_tensor.cpu().numpy()
-    warmup = 2400
-    if len(wav) > warmup:
-        mask = np.abs(wav[warmup:]) > 0.005
-        trim_start = max(warmup, warmup + np.argmax(mask) - 800) if np.any(mask) else warmup
-        
-        mask_tail = np.abs(wav) > 0.01
-        trim_end = min(len(wav), len(wav) - 1 - np.argmax(mask_tail[::-1]) + 1200 + 1) if np.any(mask_tail) else len(wav)
-        
-        wav = wav[trim_start:trim_end] if trim_start < trim_end else wav[warmup:]
-        
-        n_in = min(480, len(wav))
-        if n_in > 0: wav[:n_in] *= (np.linspace(0, 1, n_in, dtype=np.float32) ** 2)
-            
-        n_out = min(1200, len(wav))
-        if n_out > 0: wav[-n_out:] *= np.linspace(1, 0, n_out, dtype=np.float32)
-
-    if speed is not None:
-        wav = apply_speed(wav, float(speed))
-
-    max_val = np.max(np.abs(wav))
-    if max_val > 0.95:
-        wav = wav / (max_val / 0.95)
-
-    # Calculate and Log Metrics!
-    t_end = time.perf_counter()
-    gen_time = t_end - t_start
-    audio_duration = len(wav) / CONFIG.sample_rate
-    rtf = audio_duration / gen_time if gen_time > 0 else 0
-    fps = tokens_gen / gen_time if gen_time > 0 else 0
-    
-    log.info(f"Synthesized {audio_duration:.2f}s audio in {gen_time:.2f}s. RTF: {rtf:.2f}x | {fps:.1f} frames/s")
-
-    data, content_type = to_bytes_for_format(wav, CONFIG.sample_rate, response_format)
-    return data, content_type
-
-
-async def synthesize_stream_pcm(*args, **kwargs) -> AsyncIterator[np.ndarray]:
-    data, _ = synthesize(**kwargs)
     import soundfile as sf
-    wav, _ = sf.read(io.BytesIO(data), dtype="float32")
-    yield wav
+    sf.write("debugger_output_cpp.wav", wav, 24000)
+    
+    # Calculate True GPU Hardware Time
+    torch.cuda.synchronize() # Final sync to ensure events are recorded
+    total_gpu_hardware_time = sum(s.elapsed_time(e) for s, e in zip(cuda_events_start, cuda_events_end)) / 1000.0
+    
+    total_wall_time = wall_end - wall_start
+    audio_duration = len(wav) / 24000
+    rtf = audio_duration / total_wall_time
+    gpu_utilization = (total_gpu_hardware_time / total_wall_time) * 100
+
+    print_header("PROFILING RESULTS")
+    print(f"Total Wall Clock Time:      {total_wall_time:.4f} seconds")
+    print(f"Audio Duration Generated:   {audio_duration:.4f} seconds")
+    print(f"Real-Time Factor (RTF):     {rtf:.2f}x (Higher is better)")
+    print(f"Frames Per Second (FPS):    {(tokens_gen / total_wall_time):.1f}")
+    print("-" * 50)
+    print(f"CPU Python Queue Time:      {total_cpu_queue_time:.4f} sec ({(total_cpu_queue_time/total_wall_time)*100:.1f}% of wall)")
+    print(f"PCIe Sync & Idle Time:      {total_pcie_sync_time:.4f} sec ({(total_pcie_sync_time/total_wall_time)*100:.1f}% of wall)")
+    print(f"True GPU Compute Time:      {total_gpu_hardware_time:.4f} sec")
+    print("-" * 50)
+    print(f">>> GPU UTILIZATION:        {gpu_utilization:.1f}% <<<")
+    
+    if gpu_utilization > 85:
+        print("\n[CONCLUSION] PERFECT. Your CPU is no longer a bottleneck. The RTX 3090 is running at max speed.")
+    else:
+        print("\n[CONCLUSION] Sub-optimal. Consider increasing chunk_size to 50 to hide more PCIe latency.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--llm_model_path", type=str, default=None, help="Override LLM path")
+    parser.add_argument("--diffusion_model_path", type=str, default=None, help="Override DiT path")
+    args = parser.parse_args()
+
+    try:
+        run_debugger(args)
+    except Exception as e:
+        import traceback
+        print("\n[CRITICAL ERROR] The diagnostic script crashed!")
+        traceback.print_exc()
