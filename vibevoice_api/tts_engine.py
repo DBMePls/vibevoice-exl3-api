@@ -1,218 +1,214 @@
+# --- START OF FILE vibevoice_api/tts_engine.py ---
 from __future__ import annotations
-import threading
-import sys
 import os
-import math
-import time
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any, List, AsyncIterator
-import numpy as np
 import torch
-import torch.nn.functional as F
+import numpy as np
 import logging
+import io
+import time
+import base64
+from typing import Optional, Tuple, List, AsyncIterator
 
-# Add vvembed to Python Path
-VIBEVOICE_API_ROOT = os.path.dirname(os.path.abspath(__file__))
-VVEMBED_PATH = os.path.join(VIBEVOICE_API_ROOT, '..', 'vvembed')
-if VVEMBED_PATH not in sys.path:
-    sys.path.insert(0, VVEMBED_PATH)
+import soundfile as sf
+import librosa
 
-from vibevoice_api.audio_utils import apply_speed, to_bytes_for_format
 from vibevoice_api.config import CONFIG
+from vibevoice_api.audio_utils import apply_speed, to_bytes_for_format
 from vibevoice_api.voice_map import VoiceMapper
-from vibevoice_api import observability as obs
-
-from vvembed.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference, ExLlamaV3Wrapper
-from vvembed.processor.vibevoice_processor import VibeVoiceProcessor
+from exllamav3 import Config, Model, Cache, Tokenizer
+from exllamav3.tokenizer import MMEmbedding
 
 log = logging.getLogger("vibevoice_api.tts_engine")
+_engine_instance = None
 
-@dataclass
-class LoadedModel:
-    processor: VibeVoiceProcessor
-    model: VibeVoiceForConditionalGenerationInference
-    device: str
-    torch_dtype: torch.dtype
-    sample_rate: int
-    semaphore: threading.Semaphore
 
-_engine_lock = threading.Lock()
-_model_cache: Dict[str, LoadedModel] = {}
-
-def _select_device() -> Tuple[str, torch.dtype]:
-    if torch.cuda.is_available():
-        log.info("CUDA device found. Using 'cuda' with bfloat16.")
-        return "cuda", torch.bfloat16
-    log.warning("CUDA not found. Running on CPU. This will be very slow.")
-    return "cpu", torch.float32
-
-def _load_exllama_model(llm_model_path: str) -> ExLlamaV3Wrapper:
-    try:
-        from exllamav3 import Config, Model, Cache
-    except ImportError as e:
-        log.error("Fatal: exllamav3 is not installed.")
-        raise e
-
-    log.info(f"Loading exllamav3 model from: {llm_model_path}")
+def load_audio_norm(path_or_bytes) -> np.ndarray:
+    """Loads and strictly normalizes audio to -25dBFS just like upstream VibeVoice"""
+    if isinstance(path_or_bytes, bytes):
+        wav, sr = sf.read(io.BytesIO(path_or_bytes), dtype="float32")
+    else:
+        wav, sr = sf.read(path_or_bytes, dtype="float32")
+        
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    if sr != 24000:
+        wav = librosa.resample(wav, orig_sr=sr, target_sr=24000)
+        
+    target_db_fs = -25.0
+    eps = 1e-6
+    rms = np.sqrt(np.mean(wav**2))
+    target_lin = 10 ** (target_db_fs / 20.0)
+    scalar = target_lin / (rms + eps)
+    wav = wav * scalar
     
-    if not os.path.isdir(llm_model_path):
-        from huggingface_hub import snapshot_download
-        llm_model_path = snapshot_download(repo_id=llm_model_path, local_dir_use_symlinks=False)
+    maxabs = np.max(np.abs(wav))
+    if maxabs > 1.0:
+        wav /= (maxabs + eps)
+    return wav
 
-    if os.path.exists(os.path.join(llm_model_path, "snapshots")):
-        snapshot_dirs = os.listdir(os.path.join(llm_model_path, "snapshots"))
-        if snapshot_dirs:
-            llm_model_path = os.path.join(llm_model_path, "snapshots", snapshot_dirs[0])
-    
-    exllama_config = Config.from_directory(llm_model_path)
-    exllama_model = Model.from_config(exllama_config)
-    exllama_positive_cache = Cache(exllama_model, max_num_tokens=4096)
-    exllama_negative_cache = Cache(exllama_model, max_num_tokens=4096)
-    exllama_model.load()
 
-    return ExLlamaV3Wrapper(
-        model=exllama_model,
-        positive_cache=exllama_positive_cache,
-        negative_cache=exllama_negative_cache,
-        config=exllama_config
-    )
-
-def _load_model(diffusion_model_path: str, llm_model_path: str, quant_mode: str, attention_type: str) -> LoadedModel:
-    cache_key = f"{diffusion_model_path}|{llm_model_path}|{quant_mode}|{attention_type}"
-    with _engine_lock:
-        if cache_key in _model_cache:
-            return _model_cache[cache_key]
-
-        device, torch_dtype = _select_device()
-        model_kwargs = {"device_map": {"": device}, "torch_dtype": torch.bfloat16}
-
-        # 1. Load LLM via ExLlama
-        try:
-            exllama_wrapper = _load_exllama_model(llm_model_path)
-        except Exception as e:
-            log.error(f"Failed to load exllamav3: {e}")
-            raise RuntimeError(f"Could not load exllamav3 from {llm_model_path}") from e
+class EngineState:
+    def __init__(self, llm_path: str, diff_path: str):
+        log.info(f"Loading native ExLlamaV3 VibeVoice model from {llm_path}...")
+        self.config = Config.from_directory(llm_path)
+        self.model = Model.from_config(self.config)
+        self.model.load(diffusion_model_path=diff_path)
+        self.tokenizer = Tokenizer.from_config(self.config)
         
-        # 2. Load Diffusion Model
-        log.info(f"Loading Diffusion Model from '{diffusion_model_path}'")
-        processor = VibeVoiceProcessor.from_pretrained(diffusion_model_path)
-        
-        model_kwargs["attn_implementation"] = "sdpa"
-        
-        model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-            diffusion_model_path,
-            ignore_mismatched_sizes=True,
-            **model_kwargs,
-        )
+        self.speech_start_id = self.tokenizer.single_id("<|vision_start|>")
+        self.speech_end_id = self.tokenizer.single_id("<|vision_end|>")
 
-        model.exllama = exllama_wrapper
-        model.eval()
-        model.set_ddpm_inference_steps(num_steps=CONFIG.ddpm_steps)
 
-        loaded = LoadedModel(
-            processor=processor,
-            model=model,
-            device=device,
-            torch_dtype=torch_dtype,
-            sample_rate=CONFIG.sample_rate,
-            semaphore=threading.Semaphore(max(1, int(CONFIG.max_concurrency))),
-        )
-        _model_cache[cache_key] = loaded
-        return loaded
+def _get_engine() -> EngineState:
+    global _engine_instance
+    if _engine_instance is None:
+        _engine_instance = EngineState(CONFIG.llm_model_path, CONFIG.diffusion_model_path)
+    return _engine_instance
+
+
+def _create_cache(model, max_num_tokens):
+    cache = Cache(model, max_num_tokens=max_num_tokens)
+    for module in model.get_cache_layers():
+        cache.layers[module.layer_idx].alloc(module.device)
+    return cache
+
+
+def _destroy_cache(cache, model):
+    for module in model.get_cache_layers():
+        cache.layers[module.layer_idx].free()
+    cache.detach_from_model(model)
+
 
 def synthesize(
     *,
-    root_dir: str,
-    text: str,
-    voice: Optional[str],
-    voice_path: Optional[str] = None,
-    voice_data_b64: Optional[str] = None,
-    speakers: Optional[List[str]] = None,
-    response_format: str = "wav",
-    speed: Optional[float] = None,
-    seed: Optional[int] = None,
-    cfg_scale: Optional[float] = None,
-    ddpm_steps: Optional[int] = None,
-    use_sampling: Optional[bool] = None,
-    temperature: Optional[float] = None,
-    top_p: Optional[float] = None,
-    negative_llm_steps_to_cache: Optional[int] = None,
-    increase_cfg: Optional[bool] = None,
-    split_by_newline: Optional[bool] = None,
+    root_dir: str, text: str, voice: Optional[str] = "Alice",
+    voice_path: Optional[str] = None, voice_data_b64: Optional[str] = None,
+    speakers: Optional[List[str]] = None, response_format: str = "wav",
+    speed: Optional[float] = None, seed: Optional[int] = None,
+    cfg_scale: Optional[float] = None, ddpm_steps: Optional[int] = None,
+    use_sampling: Optional[bool] = None, temperature: Optional[float] = None,
+    top_p: Optional[float] = None, negative_llm_steps_to_cache: Optional[int] = None,
+    increase_cfg: Optional[bool] = None, split_by_newline: Optional[bool] = None,
 ) -> Tuple[bytes, str]:
-    state = _load_model(CONFIG.diffusion_model_path, CONFIG.llm_model_path, CONFIG.quantization_mode, CONFIG.attention_type)
-
-    mapper = VoiceMapper(root_dir)
-    voice_samples = None
-    if voice_path:
-        voice_samples = [voice_path]
+    
+    engine = _get_engine()
+    
+    # 1. Resolve Voice Audio
+    audio_source = None
+    if voice_data_b64:
+        if voice_data_b64.startswith("data:"): voice_data_b64 = voice_data_b64.split(",", 1)[1]
+        audio_source = base64.b64decode(voice_data_b64)
+    elif voice_path:
+        audio_source = voice_path
     elif voice:
-        resolved_path = mapper.resolve(voice)
-        if resolved_path:
-            voice_samples = [resolved_path]
-
-    current_seed = seed if seed is not None else CONFIG.seed
-    if current_seed == -1:
-        current_seed = np.random.randint(0, 2**32 - 1)
-    torch.manual_seed(current_seed)
-
-    text_chunks = [text.strip()]
-
-    all_audio_segments = []
-
-    with state.semaphore, torch.inference_mode():
-        state.model.set_ddpm_inference_steps(ddpm_steps or CONFIG.ddpm_steps)
+        mapper = VoiceMapper(root_dir)
+        audio_source = mapper.resolve(voice)
         
-        gen_config = {}
-        if use_sampling or CONFIG.use_sampling:
-            gen_config['do_sample'] = True
-            gen_config['temperature'] = temperature or CONFIG.temperature
-            gen_config['top_p'] = top_p or CONFIG.top_p
+    if not audio_source: raise ValueError("Could not resolve reference voice.")
+        
+    # 2. Encode Real Human Voice (100% C++)
+    wav_norm = load_audio_norm(audio_source)
+    with torch.inference_mode():
+        device = engine.model.output_device or "cuda:0"
+        audio_tensor = torch.from_numpy(wav_norm).float().unsqueeze(0).unsqueeze(0).to(device)
+        voice_embeddings = engine.model.worker.encode_acoustic(audio_tensor).cpu()
+
+    token_string = torch.full((1, voice_embeddings.shape[1]), -1, dtype=torch.long)
+    voice_mme = MMEmbedding(embeddings=voice_embeddings.squeeze(0).half(), token_string=token_string, text_alias="<$VOICE$>")
+    
+    # 3. Format Prompt
+    prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
+    prompt += " Voice input:\n Speaker 0:<|vision_start|><$VOICE$><|vision_end|>\n"
+    prompt += f" Text input:\n Speaker 0: {text.strip()}\n Speech output:\n<|vision_start|>"
+    
+    input_ids = engine.tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True, embeddings=[voice_mme])
+    
+    cfg = cfg_scale if cfg_scale is not None else CONFIG.cfg_scale
+    use_cfg = cfg > 1.0
+    seed = seed if seed is not None and seed != -1 else int(time.time())
+    increase_cfg = increase_cfg if increase_cfg is not None else CONFIG.increase_cfg
+    
+    with torch.inference_mode():
+        # 4. Static Negative CFG condition
+        if use_cfg:
+            neg_input_ids = torch.tensor([[engine.speech_start_id]], dtype=torch.long, device="cpu")
+            inputs_embeds_neg = engine.model.modules[0].forward(neg_input_ids, {})
+            _, neg_hidden = engine.model.forward(inputs_embeds=inputs_embeds_neg, params={"attn_mode": "flash_attn_nc"})
+            cond_neg = neg_hidden[:, -1:, :].half()
         else:
-            gen_config['do_sample'] = False
-
-        for i, chunk_text in enumerate(text_chunks):
-            formatted_text = f"Speaker 1: {chunk_text}\n"
+            cond_neg = None
             
-            inputs = state.processor(
-                text=[formatted_text],
-                voice_samples=[voice_samples] if voice_samples else [None],
-                return_tensors="pt",
-            ).to(state.model.device)
+        cache_pos = _create_cache(engine.model, max_num_tokens=8192)
 
-            with obs.observe_latency(obs.SYNTHESIS_LATENCY, (response_format or "wav").lower()):
-                obs.ACTIVE_INFERENCES.inc()
-                try:
-                    outputs = state.model.generate(
-                        **inputs,
-                        cfg_scale=cfg_scale or CONFIG.cfg_scale,
-                        seed=current_seed,
-                        generation_config=gen_config,
-                        tokenizer=state.processor.tokenizer,
-                        verbose=False,
-                    )
-                finally:
-                    obs.ACTIVE_INFERENCES.dec()
+        try:
+            # 5. LLM Prompt Prefill
+            inputs_embeds_pos = engine.model.modules[0].forward(input_ids, {"indexed_embeddings": [voice_mme]})
+            params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": 0, "batch_shape": (1, 8192)}
+            logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=inputs_embeds_pos, params=params_pos)
             
-            speech_tensor = outputs.speech_outputs[0]
-            if speech_tensor is not None and speech_tensor.numel() > 0:
-                all_audio_segments.append(speech_tensor.cpu())
+            past_len = inputs_embeds_pos.shape[1]
+            all_latents = []
+            log.info("Starting autoregressive diffusion loop...")
+            
+            # 6. AR Loop (Python Orchestrator, C++ Kernels)
+            for t in range(1500):
+                cond_pos = hidden_last_pos[:, -1:, :].half()
+                
+                # DiT (C++)
+                z = engine.model.worker.sample_latent(cond_pos, cond_neg if use_cfg else cond_pos, cfg, seed + t, increase_cfg)
+                all_latents.append(z)
+                
+                # Acoustic Connector (C++)
+                step_embed = engine.model.worker.acoustic_connector_forward(z.squeeze(1)).unsqueeze(1)
+                
+                # LLM Step (C++ Kernels)
+                params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": past_len, "batch_shape": (1, 8192)}
+                logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=step_embed.to(inputs_embeds_pos.dtype), params=params_pos)
+                past_len += 1
+                
+                # PCIe Sync for EOS Check
+                if logits_pos[0, -1, :].argmax().item() == engine.speech_end_id:
+                    break
+        finally:
+            _destroy_cache(cache_pos, engine.model)
 
-    if not all_audio_segments:
-        wav = np.zeros(int(0.5 * state.sample_rate), dtype=np.float32)
-    else:
-        final_audio_tensor = torch.cat(all_audio_segments, dim=-1)
-        wav = final_audio_tensor.to(torch.float32).squeeze().numpy()
+        if not all_latents: return b"", "audio/wav"
+
+        # 7. VAE Decode (100% C++)
+        latents = torch.cat(all_latents, dim=1)
+        audio_tensor = engine.model.worker.decode_vae(latents)
+
+    # 8. Post-process Audio
+    wav = audio_tensor.cpu().numpy()
+    warmup = 2400
+    if len(wav) > warmup:
+        mask = np.abs(wav[warmup:]) > 0.005
+        trim_start = max(warmup, warmup + np.argmax(mask) - 800) if np.any(mask) else warmup
+        
+        mask_tail = np.abs(wav) > 0.01
+        trim_end = min(len(wav), len(wav) - 1 - np.argmax(mask_tail[::-1]) + 1200 + 1) if np.any(mask_tail) else len(wav)
+        
+        wav = wav[trim_start:trim_end] if trim_start < trim_end else wav[warmup:]
+        
+        n_in = min(480, len(wav))
+        if n_in > 0: wav[:n_in] *= (np.linspace(0, 1, n_in, dtype=np.float32) ** 2)
+            
+        n_out = min(1200, len(wav))
+        if n_out > 0: wav[-n_out:] *= np.linspace(1, 0, n_out, dtype=np.float32)
 
     if speed is not None:
         wav = apply_speed(wav, float(speed))
 
-    data, content_type = to_bytes_for_format(wav, state.sample_rate, response_format)
+    max_val = np.max(np.abs(wav))
+    if max_val > 0.95:
+        wav = wav / (max_val / 0.95)
+
+    data, content_type = to_bytes_for_format(wav, CONFIG.sample_rate, response_format)
     return data, content_type
+
 
 async def synthesize_stream_pcm(*args, **kwargs) -> AsyncIterator[np.ndarray]:
     data, _ = synthesize(**kwargs)
     import soundfile as sf
-    import io
     wav, _ = sf.read(io.BytesIO(data), dtype="float32")
     yield wav
