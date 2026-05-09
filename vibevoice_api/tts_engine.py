@@ -92,7 +92,6 @@ def synthesize(
     
     engine = _get_engine()
     
-    # 1. Resolve Voice Audio
     audio_source = None
     if voice_data_b64:
         if voice_data_b64.startswith("data:"): voice_data_b64 = voice_data_b64.split(",", 1)[1]
@@ -105,7 +104,6 @@ def synthesize(
         
     if not audio_source: raise ValueError("Could not resolve reference voice.")
         
-    # 2. Encode Real Human Voice
     wav_norm = load_audio_norm(audio_source)
     with torch.inference_mode():
         device = engine.model.output_device or "cuda:0"
@@ -115,7 +113,6 @@ def synthesize(
     token_string = torch.full((1, voice_embeddings.shape[1]), -1, dtype=torch.long)
     voice_mme = MMEmbedding(embeddings=voice_embeddings.squeeze(0).half(), token_string=token_string, text_alias="<$VOICE$>")
     
-    # 3. Format Prompt
     prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
     prompt += " Voice input:\n Speaker 0:<|vision_start|><$VOICE$><|vision_end|>\n"
     prompt += f" Text input:\n Speaker 0: {text.strip()}\n Speech output:\n<|vision_start|>"
@@ -131,7 +128,6 @@ def synthesize(
     tokens_gen = 0
     
     with torch.inference_mode():
-        # 4. Static Negative CFG condition
         if use_cfg:
             neg_input_ids = torch.tensor([[engine.speech_start_id]], dtype=torch.long, device="cpu")
             inputs_embeds_neg = engine.model.modules[0].forward(neg_input_ids, {})
@@ -143,7 +139,6 @@ def synthesize(
         cache_pos = _create_cache(engine.model, max_num_tokens=8192)
 
         try:
-            # 5. LLM Prompt Prefill
             inputs_embeds_pos = engine.model.modules[0].forward(input_ids, {"indexed_embeddings": [voice_mme]})
             params_pos = {"attn_mode": "flash_attn", "cache": cache_pos, "past_len": 0, "batch_shape": (1, 8192)}
             logits_pos, hidden_last_pos = engine.model.forward(inputs_embeds=inputs_embeds_pos, params=params_pos)
@@ -151,15 +146,14 @@ def synthesize(
             past_len = inputs_embeds_pos.shape[1]
             all_latents = []
             
-            # 6. Pipelined AR Loop
-            chunk_size = 30
+            # --- ASYNCHRONOUS PIPELINED AR LOOP ---
+            chunk_size = 2  # Hardware optimized for RTX 3090 / Celeron
             eos_flag = torch.zeros(1, dtype=torch.bool, device=device)
             
             for chunk_start in range(0, 1500, chunk_size):
                 chunk_latents = []
                 chunk_preds = []
                 
-                # CPU queues jobs instantly
                 for t in range(chunk_start, min(chunk_start + chunk_size, 1500)):
                     cond_pos = hidden_last_pos[:, -1:, :].half()
                     
@@ -179,7 +173,7 @@ def synthesize(
                 
                 all_latents.extend(chunk_latents)
                 
-                # The single PCIe sync point
+                # Single PCIe Sync Point
                 if eos_flag.item():
                     preds_cpu = torch.stack(chunk_preds).cpu()
                     eos_indices = (preds_cpu == engine.speech_end_id).nonzero(as_tuple=True)[0]
@@ -195,36 +189,27 @@ def synthesize(
 
         if not all_latents: return b"", "audio/wav"
 
-        # 7. VAE Decode (100% C++)
         latents = torch.cat(all_latents, dim=1)
         audio_tensor = engine.model.worker.decode_vae(latents)
 
-    # 8. Post-process Audio
     wav = audio_tensor.cpu().numpy()
     warmup = 2400
     if len(wav) > warmup:
         mask = np.abs(wav[warmup:]) > 0.005
         trim_start = max(warmup, warmup + np.argmax(mask) - 800) if np.any(mask) else warmup
-        
         mask_tail = np.abs(wav) > 0.01
         trim_end = min(len(wav), len(wav) - 1 - np.argmax(mask_tail[::-1]) + 1200 + 1) if np.any(mask_tail) else len(wav)
-        
         wav = wav[trim_start:trim_end] if trim_start < trim_end else wav[warmup:]
-        
         n_in = min(480, len(wav))
         if n_in > 0: wav[:n_in] *= (np.linspace(0, 1, n_in, dtype=np.float32) ** 2)
-            
         n_out = min(1200, len(wav))
         if n_out > 0: wav[-n_out:] *= np.linspace(1, 0, n_out, dtype=np.float32)
 
-    if speed is not None:
-        wav = apply_speed(wav, float(speed))
+    if speed is not None: wav = apply_speed(wav, float(speed))
 
     max_val = np.max(np.abs(wav))
-    if max_val > 0.95:
-        wav = wav / (max_val / 0.95)
+    if max_val > 0.95: wav = wav / (max_val / 0.95)
 
-    # Calculate and Log Metrics!
     t_end = time.perf_counter()
     gen_time = t_end - t_start
     audio_duration = len(wav) / CONFIG.sample_rate
